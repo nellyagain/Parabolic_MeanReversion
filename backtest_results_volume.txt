@@ -1,0 +1,145 @@
+====================================================================================================
+  Parabolic Snapback & Washout [Daily Screener V1] — Comprehensive Backtest
+====================================================================================================
+
+  Data directory: /home/user/Parabolic_MeanReversion/../volume
+  Tickers found:  15
+
+  Configuration:
+    Short Enabled:       True
+    Long Enabled:        True
+    Large-Cap Gain:      40.0%  (price >= $20.0)
+    Small-Cap Gain:      300.0%  (price < $20.0)
+    Gain Lookback:       20 bars
+    Min Green Days:      3
+    Min Ext Above MA:    20.0%
+    Min Crash %:         30.0%
+    Crash Window:        15 bars
+    Require Prior Run:   True (min 40.0%)
+    Short Trigger:       Close < Prior Low
+    Long Trigger:        First Green Day
+    Short Stop Mode:     Run Peak
+    Long Stop Mode:      Washout Low
+    Stop Buffer:         0.2%
+    Setup Timeout:       10 / 10 bars
+    Cooldown:            3 bars
+    Max Trade Duration:  50 bars
+    Climax Volume Gate:  True (RVOL >= 3.0x, window 1 bar)
+    RVOL Baseline:       20 bar SMA
+    Volume Churn:        False
+    Min Dollar Vol:      $20.0M
+    ADR Filter:          True (max 2.5x ADR)
+    Min Price:           $5.0
+    Min ADR:             1.0%
+
+  ── Per-Ticker Results ──
+  Ticker   |  Total |  Short |   Long |  Closed |    Win% |   Avg PnL |   Avg Win |  Avg Loss |  Avg Bars
+  ----------------------------------------------------------------------------------------------------
+  COIN     | Total:   2 | Short:   1 | Long:   1 | Closed:   2 | Win%:    0.0% | Avg PnL:   -6.00% | Avg Win:   +0.00% | Avg Loss:   -6.00% | Avg Bars:   5.5
+  MSTR     | Total:   2 | Short:   0 | Long:   2 | Closed:   2 | Win%:  100.0% | Avg PnL:   +0.98% | Avg Win:   +0.98% | Avg Loss:   +0.00% | Avg Bars:   1.0
+  SHOP     | Total:   1 | Short:   1 | Long:   0 | Closed:   1 | Win%:    0.0% | Avg PnL:   -6.79% | Avg Win:   +0.00% | Avg Loss:   -6.79% | Avg Bars:   9.0
+  SMCI     | Total:   4 | Short:   1 | Long:   3 | Closed:   4 | Win%:   75.0% | Avg PnL:   +4.38% | Avg Win:   +8.15% | Avg Loss:   -6.93% | Avg Bars:   8.5
+  GME      | Total:   1 | Short:   0 | Long:   1 | Closed:   1 | Win%:    0.0% | Avg PnL:   -3.52% | Avg Win:   +0.00% | Avg Loss:   -3.52% | Avg Bars:  50.0
+
+====================================================================================================
+                    GRAND BACKTEST SUMMARY — Parabolic Mean Reversion V1
+====================================================================================================
+
+  Total Closed Trades:     10
+  Tickers With Setups:     5
+  Total Setups Generated:  10
+  Open at End (excluded):  0
+
+  ── Overall Performance ──
+  Win Rate:                50.0% (5W / 5L)
+  Avg PnL per Trade:       -0.28%
+  Avg Winner:              +5.28%
+  Avg Loser:               -5.85%
+  Profit Factor:           0.90
+  Avg R-Multiple:          -0.20R
+  Cumulative PnL:          -2.82%
+  Max Drawdown (seq):      16.76%
+  Avg Holding Period:      10.6 bars
+
+  ── By Direction ──
+  SHORT:     3 trades | Win Rate:   0.0% | Avg PnL:   -7.38%
+           Avg Win:   +0.00% | Avg Loss:   -7.38%
+  LONG:      7 trades | Win Rate:  71.4% | Avg PnL:   +2.76%
+           Avg Win:   +5.28% | Avg Loss:   -3.55%
+
+  ── By Exit Reason ──
+  STOP:           4  ( 40.0%)  Avg PnL:   -6.43%
+  TARGET_10MA:    3  ( 30.0%)  Avg PnL:   +1.23%
+  TARGET_20MA:    2  ( 20.0%)  Avg PnL:  +11.36%
+  TIMEOUT:        1  ( 10.0%)  Avg PnL:   -3.52%
+
+  ── Extremes ──
+  Best Trade:   SMCI LONG 2025-03-04 → 2025-03-12  PnL: +12.57%  (TARGET_20MA)
+  Worst Trade:  COIN SHORT 2025-05-15 → 2025-05-16  PnL: -8.42%  (STOP)
+
+  ── Top 10 Trades ──
+  Ticker   Dir    Entry Date   Exit Date         Entry       Exit     PnL%      R Exit Reason     Bars
+  -------- ------ ------------ ------------ ---------- ---------- -------- ------ -------------- -----
+  SMCI     LONG   2025-03-04   2025-03-12        39.14      44.06  +12.57% +1.05R TARGET_20MA        6
+  SMCI     LONG   2025-03-11   2025-03-12        40.84      44.98  +10.15% +0.84R TARGET_20MA        1
+  SMCI     LONG   2025-08-22   2025-08-25        43.88      44.65   +1.75% +0.29R TARGET_10MA        1
+  MSTR     LONG   2024-12-10   2024-12-11       377.32     381.38   +1.08% +0.18R TARGET_10MA        1
+  MSTR     LONG   2024-11-27   2024-11-29       388.84     392.26   +0.88% +0.07R TARGET_10MA        1
+  GME      LONG   2025-06-16   2025-08-27        23.32      22.50   -3.52% -0.45R TIMEOUT           50
+  COIN     LONG   2025-08-06   2025-08-20       303.58     292.72   -3.58% -1.00R STOP              10
+  SHOP     SHORT  2024-11-15   2024-11-29       108.49     115.85   -6.79% -1.00R STOP               9
+  SMCI     SHORT  2025-05-19   2025-06-26        44.79      47.90   -6.93% -1.00R STOP              26
+  COIN     SHORT  2025-05-15   2025-05-16       244.44     265.02   -8.42% -1.00R STOP               1
+
+  ── Bottom 10 Trades ──
+  Ticker   Dir    Entry Date   Exit Date         Entry       Exit     PnL%      R Exit Reason     Bars
+  -------- ------ ------------ ------------ ---------- ---------- -------- ------ -------------- -----
+  SMCI     LONG   2025-03-04   2025-03-12        39.14      44.06  +12.57% +1.05R TARGET_20MA        6
+  SMCI     LONG   2025-03-11   2025-03-12        40.84      44.98  +10.15% +0.84R TARGET_20MA        1
+  SMCI     LONG   2025-08-22   2025-08-25        43.88      44.65   +1.75% +0.29R TARGET_10MA        1
+  MSTR     LONG   2024-12-10   2024-12-11       377.32     381.38   +1.08% +0.18R TARGET_10MA        1
+  MSTR     LONG   2024-11-27   2024-11-29       388.84     392.26   +0.88% +0.07R TARGET_10MA        1
+  GME      LONG   2025-06-16   2025-08-27        23.32      22.50   -3.52% -0.45R TIMEOUT           50
+  COIN     LONG   2025-08-06   2025-08-20       303.58     292.72   -3.58% -1.00R STOP              10
+  SHOP     SHORT  2024-11-15   2024-11-29       108.49     115.85   -6.79% -1.00R STOP               9
+  SMCI     SHORT  2025-05-19   2025-06-26        44.79      47.90   -6.93% -1.00R STOP              26
+  COIN     SHORT  2025-05-15   2025-05-16       244.44     265.02   -8.42% -1.00R STOP               1
+
+  ── Per-Ticker Breakdown ──
+  Ticker    Trades  Short   Long    Win%   Avg PnL  Total PnL     Best    Worst
+  -------- ------- ------ ------ ------- --------- ---------- -------- --------
+  COIN           2      1      1    0.0%    -6.00%    -11.99%   -3.58%   -8.42%
+  GME            1      0      1    0.0%    -3.52%     -3.52%   -3.52%   -3.52%
+  MSTR           2      0      2  100.0%    +0.98%     +1.96%   +1.08%   +0.88%
+  SHOP           1      1      0    0.0%    -6.79%     -6.79%   -6.79%   -6.79%
+  SMCI           4      1      3   75.0%    +4.38%    +17.53%  +12.57%   -6.93%
+
+  ── Complete Trade Log (10 closed trades) ──
+     # Ticker   Dir    Entry Date   Exit Date         Entry       Stop       Exit     PnL%      R Reason          Bars    Ext%   Gain%   RVOL
+  ---- -------- ------ ------------ ------------ ---------- ---------- ---------- -------- ------ -------------- ----- ------- ------- ------
+     1 COIN     SHORT  2025-05-15   2025-05-16       244.44     265.02     265.02   -8.42% -1.00R STOP               1  +18.1%  +42.7%   2.4x
+     2 COIN     LONG   2025-08-06   2025-08-20       303.58     292.72     292.72   -3.58% -1.00R STOP              10   +0.0%   +0.0%   1.1x
+     3 GME      LONG   2025-06-16   2025-08-27        23.32      21.50      22.50   -3.52% -0.45R TIMEOUT           50   +0.0%   +0.0%   1.2x
+     4 MSTR     LONG   2024-11-27   2024-11-29       388.84     337.99     392.26   +0.88% +0.07R TARGET_10MA        1   +0.0%   +0.0%   0.9x
+     5 MSTR     LONG   2024-12-10   2024-12-11       377.32     355.34     381.38   +1.08% +0.18R TARGET_10MA        1   +0.0%   +0.0%   0.5x
+     6 SHOP     SHORT  2024-11-15   2024-11-29       108.49     115.85     115.85   -6.79% -1.00R STOP               9  +24.4%  +40.7%   1.1x
+     7 SMCI     LONG   2025-03-04   2025-03-12        39.14      34.44      44.06  +12.57% +1.05R TARGET_20MA        6   +0.0%   +0.0%   0.9x
+     8 SMCI     LONG   2025-03-11   2025-03-12        40.84      35.92      44.98  +10.15% +0.84R TARGET_20MA        1   +0.0%   +0.0%   0.8x
+     9 SMCI     SHORT  2025-05-19   2025-06-26        44.79      47.90      47.90   -6.93% -1.00R STOP              26  +24.2%  +55.6%   0.7x
+    10 SMCI     LONG   2025-08-22   2025-08-25        43.88      41.23      44.65   +1.75% +0.29R TARGET_10MA        1   +0.0%   +0.0%   0.6x
+
+====================================================================================================
+========================================================================================================================
+  RVOL SENSITIVITY ANALYSIS — Parabolic Mean Reversion V1
+========================================================================================================================
+
+    RVOL  Trades  Tickers    Win%   Avg PnL   Cum PnL     PF   Avg R   Max DD  Shorts  Longs  S Win%  L Win%  Avg Bars
+  ------ ------- -------- ------- --------- --------- ------ ------- -------- ------- ------ ------- ------- ---------
+     OFF      25        9   44.0%    -2.73%   -68.17%   0.38  -0.33R   79.24%      18      7   33.3%   71.4%      6.6
+    1.5x      18        7   44.4%    -2.60%   -46.73%   0.42  -0.36R   56.48%      11      7   27.3%   71.4%      8.2
+    2.0x      15        7   46.7%    -2.39%   -35.80%   0.45  -0.32R   52.31%       8      7   25.0%   71.4%      8.6
+    2.5x      12        6   50.0%    -1.70%   -20.45%   0.57  -0.25R   34.61%       5      7   20.0%   71.4%      9.3
+    3.0x      10        5   50.0%    -0.28%    -2.82%   0.90  -0.20R   16.76%       3      7    0.0%   71.4%     10.6
+    4.0x       9        5   55.6%    +0.46%    +4.12%   1.18  -0.11R   16.76%       2      7    0.0%   71.4%      8.9
+
+========================================================================================================================

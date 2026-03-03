@@ -2,10 +2,10 @@
 """
 Parabolic Snapback & Washout [Daily Screener V1] — Comprehensive Backtester
 
-Replicates the Pine Script V1 logic from the architecture plan against CSV OHLC data.
-Since the chart data has no volume column, volume-dependent gates (climax volume,
-RVOL, dollar volume filter) are bypassed. All price-based detection, state machines,
-triggers, risk management, and targets operate identically to the Pine Script.
+Replicates the Pine Script V1 logic from the architecture plan against CSV OHLCV data.
+Volume-dependent gates (climax volume, RVOL, dollar volume filter) are fully enabled.
+All price-based detection, state machines, triggers, risk management, and targets
+operate identically to the Pine Script.
 
 Trade outcome tracking:
   - SHORT setups: entry at trigger bar close, stop at computed stop price,
@@ -56,14 +56,18 @@ class Config:
     prior_run_min_pct: float = 40.0   # Calibrated for large-cap (plan default: 100)
     prior_run_lookback: int = 60      # Wider lookback (plan default: 40)
 
-    # Climax Volume (bypassed — no volume data)
-    use_climax_vol: bool = False  # Disabled for backtest
+    # Climax Volume
+    use_climax_vol: bool = True
     rvol_threshold: float = 3.0
     rvol_baseline: int = 20
     climax_window_bars: int = 1
+    use_volume_churn: bool = False
+    churn_range_max: float = 50.0
 
-    # Liquidity Filters (price-only; dollar vol bypassed)
+    # Liquidity Filters
     min_price: float = 5.0
+    min_avg_dollar_vol: float = 20.0  # Min avg daily dollar volume (millions)
+    dollar_vol_len: int = 20
     min_adr_pct: float = 1.0         # Lowered for stable large-caps (plan default: 2)
 
     # Setup Trigger (Daily Proxy)
@@ -113,6 +117,7 @@ class Bar:
     high: float
     low: float
     close: float
+    volume: float = 0.0
     ohlc4: float = 0.0
 
     def __post_init__(self):
@@ -142,6 +147,7 @@ class Trade:
     green_streak: int = 0
     crash_from_peak: float = 0.0
     risk_pct: float = 0.0
+    rvol_at_entry: float = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -183,13 +189,19 @@ def bb_upper(closes: list, length: int, mult: float) -> float:
 
 
 def load_csv(filepath: str) -> list:
-    """Load OHLC CSV data into Bar objects."""
+    """Load OHLCV CSV data into Bar objects."""
     bars = []
     with open(filepath, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
             ts = int(row['time'])
             dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            # Volume column may be 'Volume' or 'volume'
+            vol = 0.0
+            if 'Volume' in row:
+                vol = float(row['Volume'])
+            elif 'volume' in row:
+                vol = float(row['volume'])
             bars.append(Bar(
                 timestamp=ts,
                 date=dt.strftime('%Y-%m-%d'),
@@ -197,6 +209,7 @@ def load_csv(filepath: str) -> list:
                 high=float(row['high']),
                 low=float(row['low']),
                 close=float(row['close']),
+                volume=vol,
             ))
     return bars
 
@@ -229,7 +242,12 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
     closes = []
     highs = []
     lows = []
+    volumes = []
+    dollar_vols = []
     daily_range_pcts = []
+
+    # Climax volume tracking
+    last_climax_bar = -999
 
     # Short state machine
     short_setup_active = False
@@ -258,6 +276,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
         closes.append(bar.close)
         highs.append(bar.high)
         lows.append(bar.low)
+        volumes.append(bar.volume)
+        dollar_vols.append(bar.close * bar.volume)
 
         # ── Track open trades ──
         new_open_trades = []
@@ -373,11 +393,38 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
             continue
 
         # ═══════════════════════════════════════════════════════════
-        # LIQUIDITY GATE (price-only, no volume data)
+        # LIQUIDITY GATE (price + dollar volume + ADR)
         # ═══════════════════════════════════════════════════════════
         adr_pct = sma(daily_range_pcts, cfg.adr_len)
+        avg_dollar_vol = sma(dollar_vols, cfg.dollar_vol_len) / 1e6  # in millions
 
-        liquidity_ok = bar.close >= cfg.min_price and adr_pct >= cfg.min_adr_pct
+        liquidity_ok = (bar.close >= cfg.min_price
+                        and adr_pct >= cfg.min_adr_pct
+                        and avg_dollar_vol >= cfg.min_avg_dollar_vol)
+
+        # ═══════════════════════════════════════════════════════════
+        # CLIMAX VOLUME DETECTION (RVOL)
+        # ═══════════════════════════════════════════════════════════
+        vol_baseline = sma(volumes, cfg.rvol_baseline)
+        rvol = bar.volume / vol_baseline if vol_baseline > 0 else 0.0
+        is_climax_volume = rvol >= cfg.rvol_threshold
+
+        # Volume churn: high volume but tight range = absorption
+        is_churning = False
+        if cfg.use_volume_churn:
+            atr_base = atr_calc(bars[:i + 1], 14)
+            bar_range = bar.high - bar.low
+            range_vs_atr = (bar_range / atr_base * 100) if atr_base > 0 else 100.0
+            is_churning = rvol >= cfg.rvol_threshold and range_vs_atr <= cfg.churn_range_max
+
+        climax_vol_on_bar = is_climax_volume or is_churning
+
+        if climax_vol_on_bar:
+            last_climax_bar = i
+
+        # Gate: climax must be within N bars of current bar for activation
+        climax_aligned = (i - last_climax_bar) <= cfg.climax_window_bars
+        climax_vol_ok = climax_aligned if cfg.use_climax_vol else True
 
         # ═══════════════════════════════════════════════════════════
         # PARABOLIC ADVANCE DETECTION
@@ -416,8 +463,7 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                                       has_green_streak and is_extended and
                                       bb_ok and trend_ok)
 
-        # Climax volume bypassed (no volume data)
-        climax_vol_ok = True
+        # (climax_vol_ok computed above in the CLIMAX VOLUME DETECTION section)
 
         # ═══════════════════════════════════════════════════════════
         # WASHOUT CRASH DETECTION (Long Side)
@@ -524,6 +570,7 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     rolling_gain_pct=rolling_gain_pct,
                     green_streak=green_streak,
                     risk_pct=risk_pct,
+                    rvol_at_entry=rvol,
                 )
                 trades.append(trade)
                 open_trades.append(trade)
@@ -600,6 +647,7 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     target_slow=ts,
                     crash_from_peak=crash_from_peak,
                     risk_pct=risk_pct,
+                    rvol_at_entry=rvol,
                 )
                 trades.append(trade)
                 open_trades.append(trade)
@@ -810,13 +858,13 @@ def print_grand_summary(all_trades: list):
 
     # All closed trades log
     print(f"\n  ── Complete Trade Log ({len(closed)} closed trades) ──")
-    print(f"  {'#':>4} {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Stop':>10} {'Exit':>10} {'PnL%':>8} {'R':>6} {'Reason':<14} {'Bars':>5} {'Ext%':>7} {'Gain%':>7}")
-    print(f"  {'-'*4} {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*8} {'-'*6} {'-'*14} {'-'*5} {'-'*7} {'-'*7}")
+    print(f"  {'#':>4} {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Stop':>10} {'Exit':>10} {'PnL%':>8} {'R':>6} {'Reason':<14} {'Bars':>5} {'Ext%':>7} {'Gain%':>7} {'RVOL':>6}")
+    print(f"  {'-'*4} {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*8} {'-'*6} {'-'*14} {'-'*5} {'-'*7} {'-'*7} {'-'*6}")
     for idx, t in enumerate(sorted(closed, key=lambda x: (x.ticker, x.entry_bar)), 1):
         print(f"  {idx:>4} {t.ticker:<8} {t.direction:<6} {t.entry_date:<12} {t.exit_date:<12} "
               f"{t.entry_price:>10.2f} {t.stop_price:>10.2f} {t.exit_price:>10.2f} "
               f"{t.pnl_pct:>+7.2f}% {t.r_multiple:>+5.2f}R {t.exit_reason:<14} {t.bars_held:>5} "
-              f"{t.extension_pct:>+6.1f}% {t.rolling_gain_pct:>+6.1f}%")
+              f"{t.extension_pct:>+6.1f}% {t.rolling_gain_pct:>+6.1f}% {t.rvol_at_entry:>5.1f}x")
 
     print("\n" + "=" * 100)
 
@@ -826,10 +874,9 @@ def print_grand_summary(all_trades: list):
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs2")
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "volume")
     if not os.path.isdir(data_dir):
-        # Try alternate path
-        data_dir = "/home/user/logs2"
+        data_dir = "/home/user/volume"
     if not os.path.isdir(data_dir):
         print(f"ERROR: Data directory not found: {data_dir}")
         sys.exit(1)
@@ -865,7 +912,10 @@ def main():
     print(f"    Setup Timeout:       {cfg.short_setup_timeout} / {cfg.long_setup_timeout} bars")
     print(f"    Cooldown:            {cfg.cooldown_bars} bars")
     print(f"    Max Trade Duration:  {cfg.max_trade_bars} bars")
-    print(f"    Volume Gates:        BYPASSED (no volume in data)")
+    print(f"    Climax Volume Gate:  {cfg.use_climax_vol} (RVOL >= {cfg.rvol_threshold}x, window {cfg.climax_window_bars} bar)")
+    print(f"    RVOL Baseline:       {cfg.rvol_baseline} bar SMA")
+    print(f"    Volume Churn:        {cfg.use_volume_churn}")
+    print(f"    Min Dollar Vol:      ${cfg.min_avg_dollar_vol}M")
     print(f"    ADR Filter:          {cfg.use_adr_filter} (max {cfg.max_stop_vs_adr}x ADR)")
     print(f"    Min Price:           ${cfg.min_price}")
     print(f"    Min ADR:             {cfg.min_adr_pct}%")
@@ -888,5 +938,98 @@ def main():
     print_grand_summary(all_trades)
 
 
+def sensitivity_analysis():
+    """Run backtest across multiple RVOL thresholds to find optimal filter level."""
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "volume")
+    if not os.path.isdir(data_dir):
+        data_dir = "/home/user/volume"
+    if not os.path.isdir(data_dir):
+        print(f"ERROR: Data directory not found: {data_dir}")
+        sys.exit(1)
+
+    csv_files = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
+
+    # Pre-load all bar data
+    ticker_bars = {}
+    for csv_file in csv_files:
+        ticker = extract_ticker(csv_file)
+        ticker_bars[ticker] = load_csv(csv_file)
+
+    rvol_levels = [0.0, 1.5, 2.0, 2.5, 3.0, 4.0]
+
+    print("=" * 120)
+    print("  RVOL SENSITIVITY ANALYSIS — Parabolic Mean Reversion V1")
+    print("=" * 120)
+    print(f"\n  {'RVOL':>6} {'Trades':>7} {'Tickers':>8} {'Win%':>7} {'Avg PnL':>9} {'Cum PnL':>9} "
+          f"{'PF':>6} {'Avg R':>7} {'Max DD':>8} {'Shorts':>7} {'Longs':>6} "
+          f"{'S Win%':>7} {'L Win%':>7} {'Avg Bars':>9}")
+    print(f"  {'-'*6} {'-'*7} {'-'*8} {'-'*7} {'-'*9} {'-'*9} "
+          f"{'-'*6} {'-'*7} {'-'*8} {'-'*7} {'-'*6} "
+          f"{'-'*7} {'-'*7} {'-'*9}")
+
+    for rvol_thresh in rvol_levels:
+        cfg = Config()
+        if rvol_thresh == 0.0:
+            cfg.use_climax_vol = False
+            label = "  OFF"
+        else:
+            cfg.use_climax_vol = True
+            cfg.rvol_threshold = rvol_thresh
+            label = f"{rvol_thresh:.1f}x"
+
+        all_trades = []
+        for ticker, bars in ticker_bars.items():
+            trades = run_backtest(ticker, bars, cfg)
+            all_trades.extend(trades)
+
+        closed = [t for t in all_trades if t.exit_reason not in ("OPEN_AT_END", "")]
+        if not closed:
+            print(f"  {label:>6} {'0':>7} {'0':>8} {'N/A':>7} {'N/A':>9} {'N/A':>9} "
+                  f"{'N/A':>6} {'N/A':>7} {'N/A':>8} {'0':>7} {'0':>6} "
+                  f"{'N/A':>7} {'N/A':>7} {'N/A':>9}")
+            continue
+
+        wins = [t for t in closed if t.pnl_pct > 0]
+        losses = [t for t in closed if t.pnl_pct <= 0]
+        shorts = [t for t in closed if t.direction == "SHORT"]
+        longs = [t for t in closed if t.direction == "LONG"]
+        short_wins = [t for t in shorts if t.pnl_pct > 0]
+        long_wins = [t for t in longs if t.pnl_pct > 0]
+
+        win_rate = len(wins) / len(closed) * 100
+        avg_pnl = sum(t.pnl_pct for t in closed) / len(closed)
+        cum_pnl = sum(t.pnl_pct for t in closed)
+        gross_profit = sum(t.pnl_pct for t in wins) if wins else 0
+        gross_loss = abs(sum(t.pnl_pct for t in losses)) if losses else 0
+        pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        r_vals = [t.r_multiple for t in closed if t.risk_pct > 0]
+        avg_r = sum(r_vals) / len(r_vals) if r_vals else 0
+        avg_bars = sum(t.bars_held for t in closed) / len(closed)
+        tickers_with = len(set(t.ticker for t in closed))
+        s_wr = len(short_wins) / len(shorts) * 100 if shorts else 0
+        l_wr = len(long_wins) / len(longs) * 100 if longs else 0
+
+        # Max drawdown
+        cumulative = 0.0
+        peak_cum = 0.0
+        max_dd = 0.0
+        for t in sorted(closed, key=lambda x: x.entry_bar):
+            cumulative += t.pnl_pct
+            if cumulative > peak_cum:
+                peak_cum = cumulative
+            dd = peak_cum - cumulative
+            if dd > max_dd:
+                max_dd = dd
+
+        print(f"  {label:>6} {len(closed):>7} {tickers_with:>8} {win_rate:>6.1f}% {avg_pnl:>+8.2f}% {cum_pnl:>+8.2f}% "
+              f"{pf:>6.2f} {avg_r:>+6.2f}R {max_dd:>7.2f}% {len(shorts):>7} {len(longs):>6} "
+              f"{s_wr:>6.1f}% {l_wr:>6.1f}% {avg_bars:>8.1f}")
+
+    print("\n" + "=" * 120)
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--sensitivity":
+        sensitivity_analysis()
+    else:
+        main()
