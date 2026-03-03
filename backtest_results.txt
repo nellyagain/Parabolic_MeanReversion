@@ -1,0 +1,175 @@
+====================================================================================================
+  Parabolic Snapback & Washout [Daily Screener V1] — Comprehensive Backtest
+====================================================================================================
+
+  Data directory: /home/user/Parabolic_MeanReversion/../logs2
+  Tickers found:  49
+
+  Configuration:
+    Short Enabled:       True
+    Long Enabled:        True
+    Large-Cap Gain:      40.0%  (price >= $20.0)
+    Small-Cap Gain:      300.0%  (price < $20.0)
+    Gain Lookback:       20 bars
+    Min Green Days:      3
+    Min Ext Above MA:    20.0%
+    Min Crash %:         30.0%
+    Crash Window:        15 bars
+    Require Prior Run:   True (min 40.0%)
+    Short Trigger:       Close < Prior Low
+    Long Trigger:        First Green Day
+    Short Stop Mode:     Run Peak
+    Long Stop Mode:      Washout Low
+    Stop Buffer:         0.2%
+    Setup Timeout:       10 / 10 bars
+    Cooldown:            3 bars
+    Max Trade Duration:  50 bars
+    Volume Gates:        BYPASSED (no volume in data)
+    ADR Filter:          True (max 2.5x ADR)
+    Min Price:           $5.0
+    Min ADR:             1.0%
+
+  ── Per-Ticker Results ──
+  Ticker   |  Total |  Short |   Long |  Closed |    Win% |   Avg PnL |   Avg Win |  Avg Loss |  Avg Bars
+  ----------------------------------------------------------------------------------------------------
+  AMD      | Total:   7 | Short:   7 | Long:   0 | Closed:   7 | Win%:   71.4% | Avg PnL:   -0.19% | Avg Win:   +3.26% | Avg Loss:   -8.81% | Avg Bars:   7.4
+  AVGO     | Total:   2 | Short:   2 | Long:   0 | Closed:   2 | Win%:  100.0% | Avg PnL:   +4.09% | Avg Win:   +4.09% | Avg Loss:   +0.00% | Avg Bars:   1.5
+  MSFT     | Total:   1 | Short:   1 | Long:   0 | Closed:   1 | Win%:    0.0% | Avg PnL:   -6.25% | Avg Win:   +0.00% | Avg Loss:   -6.25% | Avg Bars:   5.0
+  NFLX     | Total:   1 | Short:   1 | Long:   0 | Closed:   1 | Win%:  100.0% | Avg PnL:   +5.37% | Avg Win:   +5.37% | Avg Loss:   +0.00% | Avg Bars:   3.0
+  NVDA     | Total:   5 | Short:   4 | Long:   1 | Closed:   5 | Win%:   20.0% | Avg PnL:   -6.31% | Avg Win:   +1.80% | Avg Loss:   -8.34% | Avg Bars:   2.8
+  QCOM     | Total:   2 | Short:   2 | Long:   0 | Closed:   2 | Win%:   50.0% | Avg PnL:   -0.23% | Avg Win:   +3.94% | Avg Loss:   -4.39% | Avg Bars:   6.0
+  ABT      | Total:   1 | Short:   1 | Long:   0 | Closed:   1 | Win%:  100.0% | Avg PnL:   +4.00% | Avg Win:   +4.00% | Avg Loss:   +0.00% | Avg Bars:   8.0
+  AXP      | Total:   1 | Short:   1 | Long:   0 | Closed:   1 | Win%:  100.0% | Avg PnL:   +6.21% | Avg Win:   +6.21% | Avg Loss:   +0.00% | Avg Bars:   2.0
+  BA       | Total:   2 | Short:   2 | Long:   0 | Closed:   2 | Win%:   50.0% | Avg PnL:   +3.43% | Avg Win:  +18.80% | Avg Loss:  -11.95% | Avg Bars:   4.5
+  CRM      | Total:   1 | Short:   1 | Long:   0 | Closed:   1 | Win%:  100.0% | Avg PnL:   +3.88% | Avg Win:   +3.88% | Avg Loss:   +0.00% | Avg Bars:   1.0
+  CVX      | Total:   2 | Short:   2 | Long:   0 | Closed:   2 | Win%:  100.0% | Avg PnL:   +3.86% | Avg Win:   +3.86% | Avg Loss:   +0.00% | Avg Bars:   1.5
+  GE       | Total:   1 | Short:   1 | Long:   0 | Closed:   1 | Win%:  100.0% | Avg PnL:   +7.84% | Avg Win:   +7.84% | Avg Loss:   +0.00% | Avg Bars:   2.0
+  JPM      | Total:   2 | Short:   1 | Long:   1 | Closed:   2 | Win%:  100.0% | Avg PnL:   +3.05% | Avg Win:   +3.05% | Avg Loss:   +0.00% | Avg Bars:   3.0
+  NEM      | Total:   2 | Short:   2 | Long:   0 | Closed:   2 | Win%:    0.0% | Avg PnL:   -6.58% | Avg Win:   +0.00% | Avg Loss:   -6.58% | Avg Bars:   3.5
+  SCHW     | Total:   1 | Short:   0 | Long:   1 | Closed:   1 | Win%:  100.0% | Avg PnL:   +7.43% | Avg Win:   +7.43% | Avg Loss:   +0.00% | Avg Bars:   9.0
+  UNH      | Total:   1 | Short:   1 | Long:   0 | Closed:   1 | Win%:    0.0% | Avg PnL:   -7.96% | Avg Win:   +0.00% | Avg Loss:   -7.96% | Avg Bars:  27.0
+  UPS      | Total:   1 | Short:   1 | Long:   0 | Closed:   1 | Win%:    0.0% | Avg PnL:   -4.60% | Avg Win:   +0.00% | Avg Loss:   -4.60% | Avg Bars:  14.0
+
+====================================================================================================
+                    GRAND BACKTEST SUMMARY — Parabolic Mean Reversion V1
+====================================================================================================
+
+  Total Closed Trades:     33
+  Tickers With Setups:     17
+  Total Setups Generated:  33
+  Open at End (excluded):  0
+
+  ── Overall Performance ──
+  Win Rate:                60.6% (20W / 13L)
+  Avg PnL per Trade:       -0.05%
+  Avg Winner:              +4.88%
+  Avg Loser:               -7.64%
+  Profit Factor:           0.98
+  Avg R-Multiple:          +0.09R
+  Cumulative PnL:          -1.76%
+  Max Drawdown (seq):      33.93%
+  Avg Holding Period:      5.4 bars
+
+  ── By Direction ──
+  SHORT:    30 trades | Win Rate:  60.0% | Avg PnL:   +0.00%
+           Avg Win:   +4.94% | Avg Loss:   -7.39%
+  LONG:      3 trades | Win Rate:  66.7% | Avg PnL:   -0.63%
+           Avg Win:   +4.35% | Avg Loss:  -10.58%
+
+  ── By Exit Reason ──
+  STOP:          13  ( 39.4%)  Avg PnL:   -7.64%
+  TARGET_10MA:   20  ( 60.6%)  Avg PnL:   +4.88%
+  TARGET_20MA:    0  (  0.0%)  Avg PnL:   +0.00%
+  TIMEOUT:        0  (  0.0%)  Avg PnL:   +0.00%
+
+  ── Extremes ──
+  Best Trade:   BA SHORT 2020-06-09 → 2020-06-11  PnL: +18.80%  (TARGET_10MA)
+  Worst Trade:  BA SHORT 2020-11-20 → 2020-12-02  PnL: -11.95%  (STOP)
+
+  ── Top 10 Trades ──
+  Ticker   Dir    Entry Date   Exit Date         Entry       Exit     PnL%      R Exit Reason     Bars
+  -------- ------ ------------ ------------ ---------- ---------- -------- ------ -------------- -----
+  BA       SHORT  2020-06-09   2020-06-11       216.74     176.00  +18.80% +2.27R TARGET_10MA        2
+  AMD      SHORT  2021-08-05   2021-08-18       112.35     103.44   +7.93% +0.86R TARGET_10MA        9
+  AVGO     SHORT  2024-06-20   2024-06-24       173.46     159.85   +7.84% +1.13R TARGET_10MA        2
+  GE       SHORT  2020-06-09   2020-06-11        39.93      36.80   +7.84% +1.11R TARGET_10MA        2
+  SCHW     LONG   2020-06-29   2020-07-13        32.75      35.18   +7.43% +2.06R TARGET_10MA        9
+  AXP      SHORT  2020-06-09   2020-06-11       110.46     103.60   +6.21% +1.97R TARGET_10MA        2
+  AMD      SHORT  2023-02-06   2023-02-17        83.68      79.05   +5.53% +0.85R TARGET_10MA        9
+  NFLX     SHORT  2018-01-31   2018-02-05        27.03      25.58   +5.37% +0.85R TARGET_10MA        3
+  CVX      SHORT  2020-11-25   2020-11-30        92.14      87.43   +5.11% +1.22R TARGET_10MA        2
+  JPM      SHORT  2009-04-14   2009-04-21        30.70      29.22   +4.82% +0.42R TARGET_10MA        5
+
+  ── Bottom 10 Trades ──
+  Ticker   Dir    Entry Date   Exit Date         Entry       Exit     PnL%      R Exit Reason     Bars
+  -------- ------ ------------ ------------ ---------- ---------- -------- ------ -------------- -----
+  NEM      SHORT  2020-04-15   2020-04-22        58.22      61.65   -5.90% -1.00R STOP               5
+  MSFT     SHORT  2001-01-31   2001-02-07        30.53      32.44   -6.25% -1.00R STOP               5
+  AMD      SHORT  2025-05-15   2025-06-10       114.99     122.77   -6.76% -1.00R STOP              17
+  NEM      SHORT  2016-02-09   2016-02-11        24.30      26.07   -7.27% -1.00R STOP               2
+  NVDA     SHORT  2023-01-30   2023-02-01        19.16      20.67   -7.87% -1.00R STOP               2
+  UNH      SHORT  2020-04-20   2020-05-28       282.14     304.61   -7.96% -1.00R STOP              27
+  NVDA     SHORT  2021-11-10   2021-11-18        29.46      32.37   -9.90% -1.00R STOP               6
+  NVDA     LONG   2020-03-13   2020-03-16         6.02       5.38  -10.58% -1.00R STOP               1
+  AMD      SHORT  2023-05-31   2023-06-13       118.21     131.05  -10.86% -1.00R STOP               9
+  BA       SHORT  2020-11-20   2020-12-02       199.62     223.47  -11.95% -1.00R STOP               7
+
+  ── Per-Ticker Breakdown ──
+  Ticker    Trades  Short   Long    Win%   Avg PnL  Total PnL     Best    Worst
+  -------- ------- ------ ------ ------- --------- ---------- -------- --------
+  ABT            1      1      0  100.0%    +4.00%     +4.00%   +4.00%   +4.00%
+  AMD            7      7      0   71.4%    -0.19%     -1.33%   +7.93%  -10.86%
+  AVGO           2      2      0  100.0%    +4.09%     +8.19%   +7.84%   +0.34%
+  AXP            1      1      0  100.0%    +6.21%     +6.21%   +6.21%   +6.21%
+  BA             2      2      0   50.0%    +3.43%     +6.85%  +18.80%  -11.95%
+  CRM            1      1      0  100.0%    +3.88%     +3.88%   +3.88%   +3.88%
+  CVX            2      2      0  100.0%    +3.86%     +7.72%   +5.11%   +2.61%
+  GE             1      1      0  100.0%    +7.84%     +7.84%   +7.84%   +7.84%
+  JPM            2      1      1  100.0%    +3.05%     +6.09%   +4.82%   +1.27%
+  MSFT           1      1      0    0.0%    -6.25%     -6.25%   -6.25%   -6.25%
+  NEM            2      2      0    0.0%    -6.58%    -13.17%   -5.90%   -7.27%
+  NFLX           1      1      0  100.0%    +5.37%     +5.37%   +5.37%   +5.37%
+  NVDA           5      4      1   20.0%    -6.31%    -31.56%   +1.80%  -10.58%
+  QCOM           2      2      0   50.0%    -0.23%     -0.45%   +3.94%   -4.39%
+  SCHW           1      0      1  100.0%    +7.43%     +7.43%   +7.43%   +7.43%
+  UNH            1      1      0    0.0%    -7.96%     -7.96%   -7.96%   -7.96%
+  UPS            1      1      0    0.0%    -4.60%     -4.60%   -4.60%   -4.60%
+
+  ── Complete Trade Log (33 closed trades) ──
+     # Ticker   Dir    Entry Date   Exit Date         Entry       Stop       Exit     PnL%      R Reason          Bars    Ext%   Gain%
+  ---- -------- ------ ------------ ------------ ---------- ---------- ---------- -------- ------ -------------- ----- ------- -------
+     1 ABT      SHORT  2020-04-21   2020-05-01        94.05     100.20      90.29   +4.00% +0.61R TARGET_10MA        8  +12.6%  +45.8%
+     2 AMD      SHORT  2020-04-21   2020-04-29        52.92      58.75      52.90   +0.03% +0.00R TARGET_10MA        6   +7.4%  +26.9%
+     3 AMD      SHORT  2020-08-10   2020-08-11        82.24      87.46      80.12   +2.58% +0.41R TARGET_10MA        1  +17.9%  +57.4%
+     4 AMD      SHORT  2021-08-05   2021-08-18       112.35     122.73     103.44   +7.93% +0.86R TARGET_10MA        9  +16.9%  +33.4%
+     5 AMD      SHORT  2023-02-06   2023-02-17        83.68      89.12      79.05   +5.53% +0.85R TARGET_10MA        9  +12.1%  +27.4%
+     6 AMD      SHORT  2023-05-31   2023-06-13       118.21     131.05     131.05  -10.86% -1.00R STOP               9  +14.3%  +45.9%
+     7 AMD      SHORT  2025-05-15   2025-06-10       114.99     122.77     122.77   -6.76% -1.00R STOP              17  +15.9%  +37.3%
+     8 AMD      SHORT  2025-10-22   2025-10-23       230.23     243.37     229.74   +0.21% +0.04R TARGET_10MA        1  +12.6%  +48.7%
+     9 AVGO     SHORT  2024-06-20   2024-06-24       173.46     185.53     159.85   +7.84% +1.13R TARGET_10MA        2  +16.6%  +33.2%
+    10 AVGO     SHORT  2024-12-30   2024-12-31       235.58     247.77     234.77   +0.34% +0.07R TARGET_10MA        1  +13.7%  +44.7%
+    11 AXP      SHORT  2020-06-09   2020-06-11       110.46     113.94     103.60   +6.21% +1.97R TARGET_10MA        2  +16.1%  +45.3%
+    12 BA       SHORT  2020-06-09   2020-06-11       216.74     234.67     176.00  +18.80% +2.27R TARGET_10MA        2  +41.2%  +90.3%
+    13 BA       SHORT  2020-11-20   2020-12-02       199.62     223.47     223.47  -11.95% -1.00R STOP               7  +15.4%  +41.0%
+    14 CRM      SHORT  2020-09-03   2020-09-04       265.01     285.07     254.74   +3.88% +0.51R TARGET_10MA        1  +16.9%  +38.2%
+    15 CVX      SHORT  2020-04-15   2020-04-16        82.49      90.09      80.34   +2.61% +0.28R TARGET_10MA        1  +13.4%  +59.9%
+    16 CVX      SHORT  2020-11-25   2020-11-30        92.14      96.01      87.43   +5.11% +1.22R TARGET_10MA        2  +14.0%  +41.4%
+    17 GE       SHORT  2020-06-09   2020-06-11        39.93      42.75      36.80   +7.84% +1.11R TARGET_10MA        2  +18.4%  +46.4%
+    18 JPM      LONG   2008-10-28   2008-10-29        37.60      32.45      38.08   +1.27% +0.09R TARGET_10MA        1   +0.0%   +0.0%
+    19 JPM      SHORT  2009-04-14   2009-04-21        30.70      34.22      29.22   +4.82% +0.42R TARGET_10MA        5  +10.1%  +37.9%
+    20 MSFT     SHORT  2001-01-31   2001-02-07        30.53      32.44      32.44   -6.25% -1.00R STOP               5   +8.3%  +41.6%
+    21 NEM      SHORT  2016-02-09   2016-02-11        24.30      26.07      26.07   -7.27% -1.00R STOP               2  +24.3%  +51.4%
+    22 NEM      SHORT  2020-04-15   2020-04-22        58.22      61.65      61.65   -5.90% -1.00R STOP               5  +19.5%  +56.8%
+    23 NFLX     SHORT  2018-01-31   2018-02-05        27.03      28.74      25.58   +5.37% +0.85R TARGET_10MA        3  +15.3%  +34.1%
+    24 NVDA     LONG   2020-03-13   2020-03-16         6.02       5.38       5.38  -10.58% -1.00R STOP               1   +0.0%   +0.0%
+    25 NVDA     SHORT  2021-11-10   2021-11-18        29.46      32.37      32.37   -9.90% -1.00R STOP               6  +16.0%  +39.5%
+    26 NVDA     SHORT  2023-01-30   2023-02-01        19.16      20.67      20.67   -7.87% -1.00R STOP               2  +12.5%  +36.5%
+    27 NVDA     SHORT  2024-05-30   2024-06-04       110.50     116.05     116.05   -5.02% -1.00R STOP               3  +14.9%  +32.8%
+    28 NVDA     SHORT  2025-05-21   2025-05-23       131.80     137.67     129.43   +1.80% +0.40R TARGET_10MA        2   +9.4%  +27.8%
+    29 QCOM     SHORT  2019-04-25   2019-05-02        85.07      88.81      88.81   -4.39% -1.00R STOP               5  +29.4%  +52.5%
+    30 QCOM     SHORT  2021-11-22   2021-12-02       181.40     189.15     174.25   +3.94% +0.92R TARGET_10MA        7  +14.6%  +39.0%
+    31 SCHW     LONG   2020-06-29   2020-07-13        32.75      31.57      35.18   +7.43% +2.06R TARGET_10MA        9   +0.0%   +0.0%
+    32 UNH      SHORT  2020-04-20   2020-05-28       282.14     304.61     304.61   -7.96% -1.00R STOP              27  +11.3%  +50.3%
+    33 UPS      SHORT  2020-08-11   2020-08-31       155.85     163.03     163.03   -4.60% -1.00R STOP              14  +17.7%  +34.2%
+
+====================================================================================================
