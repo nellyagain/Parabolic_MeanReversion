@@ -1,0 +1,585 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Parabolic Mean Reversion V1
+
+//@version=6
+indicator("Parabolic Snapback & Washout [Daily Screener V1]", shorttitle="PMR V1", overlay=true, max_labels_count=500, max_lines_count=500, max_bars_back=500)
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 1: INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Group: Parabolic SHORT — Advance Detection ──
+enableShort       = input.bool(true, "Enable Parabolic Short Setups", group="Parabolic SHORT — Advance Detection")
+largecapGainPct   = input.float(60.0, "Min % Gain (Large-Cap)", minval=1.0, group="Parabolic SHORT — Advance Detection")
+smallcapGainPct   = input.float(300.0, "Min % Gain (Small-Cap)", minval=1.0, group="Parabolic SHORT — Advance Detection")
+capCutoffPrice    = input.float(20.0, "Cap Cutoff Price ($)", minval=1.0, group="Parabolic SHORT — Advance Detection")
+useManualThreshold = input.bool(false, "Use Manual Threshold Override", group="Parabolic SHORT — Advance Detection")
+manualGainPct     = input.float(80.0, "Manual Gain Threshold %", minval=1.0, group="Parabolic SHORT — Advance Detection")
+gainLookback      = input.int(20, "Gain Lookback (bars)", minval=5, group="Parabolic SHORT — Advance Detection")
+minGreenDays      = input.int(3, "Min Consecutive Green Days", minval=1, group="Parabolic SHORT — Advance Detection")
+minExtAboveMA     = input.float(30.0, "Min Extension Above MA %", minval=1.0, group="Parabolic SHORT — Advance Detection")
+extMA_Len         = input.int(20, "Extension MA Length", minval=5, group="Parabolic SHORT — Advance Detection")
+useExtBBFilter    = input.bool(false, "Require Close > Upper BB", group="Parabolic SHORT — Advance Detection")
+bbDevMult         = input.float(3.0, "BB Std Dev Multiplier", minval=0.5, step=0.5, group="Parabolic SHORT — Advance Detection")
+
+// ── Group: Parabolic LONG — Washout Detection ──
+enableLong        = input.bool(true, "Enable Washout Bounce Setups", group="Parabolic LONG — Washout Detection")
+minCrashPct       = input.float(50.0, "Min Crash % From Peak", minval=10.0, group="Parabolic LONG — Washout Detection")
+crashWindow       = input.int(5, "Max Crash Window (bars)", minval=1, group="Parabolic LONG — Washout Detection")
+requirePriorRun   = input.bool(true, "Require Prior Parabolic Run", group="Parabolic LONG — Washout Detection")
+priorRunMinPct    = input.float(100.0, "Prior Run Min % Gain", minval=10.0, group="Parabolic LONG — Washout Detection")
+priorRunLookback  = input.int(40, "Prior Run Lookback (bars)", minval=10, group="Parabolic LONG — Washout Detection")
+
+// ── Group: Climax Volume ──
+useClimaxVol      = input.bool(true, "Require Climax Volume", group="Climax Volume")
+rvolThreshold     = input.float(3.0, "RVOL Threshold", minval=1.0, step=0.5, group="Climax Volume")
+rvolBaseline      = input.int(20, "RVOL Baseline SMA Length", minval=5, group="Climax Volume")
+climaxWindowBars  = input.int(1, "Climax Alignment Window (bars)", minval=0, group="Climax Volume")
+useVolumeChurn    = input.bool(false, "Detect Volume Churn", group="Climax Volume")
+churnRangeMax     = input.float(50.0, "Churn: Max Range % of ATR", minval=10.0, group="Climax Volume")
+useVolExpansionScore = input.bool(false, "Track Volume Expansion Score", group="Climax Volume")
+
+// ── Group: Liquidity Filters ──
+minPrice          = input.float(5.0, "Min Stock Price ($)", minval=0.0, group="Liquidity Filters")
+minAvgDollarVol   = input.float(20.0, "Min Avg Dollar Vol (Millions)", minval=0.0, group="Liquidity Filters")
+dollarVolLen      = input.int(20, "Dollar Vol SMA Length", minval=5, group="Liquidity Filters")
+minADR_Pct        = input.float(2.0, "Min ADR %", minval=0.0, group="Liquidity Filters")
+
+// ── Group: Setup Trigger (Daily Proxy) ──
+shortTrigger      = input.string("Close < Prior Low", "Short Trigger", options=["First Red Day", "Close < Prior Low", "Close < Run AVWAP", "Any Reversal"], group="Setup Trigger (Daily Proxy)")
+longTrigger       = input.string("First Green Day", "Long Trigger", options=["First Green Day", "Close > Prior High", "Close > Run AVWAP", "Any Reversal"], group="Setup Trigger (Daily Proxy)")
+showRunAVWAP      = input.bool(true, "Show Run AVWAP Line", group="Setup Trigger (Daily Proxy)")
+minBarsAfterSetup = input.int(0, "Min Bars After Setup Before Trigger", minval=0, group="Setup Trigger (Daily Proxy)")
+
+// ── Group: Targets ──
+targetMode        = input.string("Dual (10 & 20)", "Target MA Mode", options=["10 MA", "20 MA", "Dual (10 & 20)"], group="Targets")
+targetMA_Fast     = input.int(10, "Fast Target MA Length", minval=2, group="Targets")
+targetMA_Slow     = input.int(20, "Slow Target MA Length", minval=2, group="Targets")
+showTargetLines   = input.bool(true, "Show Target MA Lines", group="Targets")
+
+// ── Group: Trend Context ──
+useTrendFilter    = input.bool(false, "Use Trend Filter (OFF = counter-trend)", group="Trend Context")
+trendMA_Len       = input.int(50, "Trend MA Length", minval=5, group="Trend Context")
+
+// ── Group: Quality Gates ──
+minCloseStrength  = input.float(0.0, "Min Close Strength (0–1)", minval=0.0, maxval=1.0, step=0.1, group="Quality Gates")
+useADRFilter      = input.bool(true, "Enforce ADR Stop Width Ceiling", group="Quality Gates")
+adrLen            = input.int(20, "ADR Calculation Length", minval=5, group="Quality Gates")
+maxStopVsADR      = input.float(1.0, "Max Stop Width vs ADR", minval=0.1, step=0.1, group="Quality Gates")
+
+// ── Group: Risk Management ──
+shortStopMode     = input.string("Run Peak", "Short Stop Mode", options=["Run Peak", "Trigger Bar High", "ATR Based"], group="Risk Management")
+longStopMode      = input.string("Washout Low", "Long Stop Mode", options=["Washout Low", "ATR Based"], group="Risk Management")
+stopBuffer        = input.float(0.2, "Stop Buffer %", minval=0.0, step=0.1, group="Risk Management")
+atrLen            = input.int(14, "ATR Length", minval=5, group="Risk Management")
+atrMult           = input.float(2.0, "ATR Multiplier", minval=0.5, step=0.5, group="Risk Management")
+maxLineAge        = input.int(50, "Max Stop Line Age (bars)", minval=5, group="Risk Management")
+
+// ── Group: Timeouts & Cooldown ──
+shortSetupTimeout = input.int(5, "Short Setup Timeout (bars)", minval=1, group="Timeouts & Cooldown")
+longSetupTimeout  = input.int(5, "Long Setup Timeout (bars)", minval=1, group="Timeouts & Cooldown")
+cooldownBars      = input.int(3, "Cooldown Between Setups (bars)", minval=0, group="Timeouts & Cooldown")
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 2: PARABOLIC ADVANCE DETECTION ENGINE
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Early-bar guard (Section 14.2) ──
+enoughBarsForGain = bar_index >= gainLookback
+enoughBarsForPeak = bar_index >= priorRunLookback
+
+// ── Liquidity Gate ──
+avgDollarVol = ta.sma(close * volume, dollarVolLen) / 1e6
+dailyRangePct = ((high / low) - 1) * 100
+adrPct = ta.sma(dailyRangePct, adrLen)
+
+liquidityOk = close >= minPrice and avgDollarVol >= minAvgDollarVol and adrPct >= minADR_Pct
+
+// ── Rolling Gain ──
+recentLow = enoughBarsForGain ? ta.lowest(low, gainLookback) : low
+rollingGainPct = recentLow > 0 ? ((close - recentLow) / recentLow) * 100 : 0.0
+
+gainThreshold = useManualThreshold ? manualGainPct : (close >= capCutoffPrice ? largecapGainPct : smallcapGainPct)
+isParabolicGain = enoughBarsForGain and rollingGainPct >= gainThreshold
+
+// ── Consecutive Green Days ──
+isGreenDay = close > close[1]
+var int greenStreak = 0
+greenStreak := isGreenDay ? greenStreak + 1 : 0
+hasGreenStreak = greenStreak >= minGreenDays
+
+// ── Extension Above MA ──
+extMA = ta.sma(close, extMA_Len)
+extensionPct = extMA > 0 ? ((close - extMA) / extMA) * 100 : 0.0
+isExtended = extensionPct >= minExtAboveMA
+
+// ── Bollinger Band Gate (optional) ──
+[bbMid, bbUpper, bbLower] = ta.bb(close, extMA_Len, bbDevMult)
+bbOk = useExtBBFilter ? close > bbUpper : true
+
+// ── Trend Filter (optional — OFF by default for counter-trend) ──
+trendMA = ta.sma(close, trendMA_Len)
+trendOk = useTrendFilter ? close > trendMA : true
+
+// ── Combined Detection ──
+parabolicAdvanceDetected = liquidityOk and isParabolicGain and hasGreenStreak and isExtended and bbOk and trendOk
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 3: CLIMAX VOLUME DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+volBaseline = ta.sma(volume, rvolBaseline)
+rvol = nz(volBaseline, 1) > 0 ? volume / nz(volBaseline, 1) : 0.0
+isClimaxVolume = rvol >= rvolThreshold
+
+// Volume churn: huge volume but tight range = absorption
+atrBase = ta.atr(14)
+barRange = high - low
+rangeVsATR = atrBase > 0 ? (barRange / atrBase) * 100 : 100.0
+isChurning = useVolumeChurn ? (rvol >= rvolThreshold and rangeVsATR <= churnRangeMax) : false
+
+climaxVolOnBar = isClimaxVolume or isChurning
+
+// Track last climax bar for alignment window
+var int lastClimaxBar = na
+if climaxVolOnBar
+    lastClimaxBar := bar_index
+
+// Gate: climax must be within N bars of current bar for activation
+climaxAligned = not na(lastClimaxBar) and (bar_index - lastClimaxBar <= climaxWindowBars)
+climaxVolOk = useClimaxVol ? climaxAligned : true
+
+// ── Volume Expansion Score (optional ranking metric) ──
+var int volExpansionCount = 0
+if isGreenDay and volume > volume[1]
+    volExpansionCount := volExpansionCount + 1
+else if not isGreenDay
+    volExpansionCount := 0
+volExpansionScore = useVolExpansionScore ? volExpansionCount : 0
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 4: WASHOUT CRASH DETECTION (Long Side)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Peak and Crash Measurement ──
+peakOffset = enoughBarsForPeak ? ta.highestbars(high, priorRunLookback) : 0
+peakBarIdx = bar_index + peakOffset
+recentPeakHigh = high[math.abs(peakOffset)]
+
+barsFromPeak = bar_index - peakBarIdx
+crashFromPeak = recentPeakHigh > 0 ? ((recentPeakHigh - close) / recentPeakHigh) * 100 : 0.0
+
+isCrashCandidate = enoughBarsForPeak and crashFromPeak >= minCrashPct and barsFromPeak <= crashWindow
+
+// ── Prior Parabolic Run Verification ──
+// Index arithmetic:
+//   barsBack = bar_index - peakBarIdx = offset from current bar to peak
+//   low[barsBack] = the peak bar's low
+//   low[barsBack + k] = k bars BEFORE the peak
+//   We search from peak back priorRunLookback bars to find the run's starting low
+var bool hadPriorRun = true
+if requirePriorRun and enoughBarsForPeak and not na(peakBarIdx)
+    barsBack = bar_index - peakBarIdx
+    float priorRunLow = recentPeakHigh
+    upperBound = math.min(barsBack + priorRunLookback, bar_index)
+    for i = barsBack to upperBound - 1
+        if low[i] < priorRunLow
+            priorRunLow := low[i]
+    priorRunGain = priorRunLow > 0 ? ((recentPeakHigh - priorRunLow) / priorRunLow) * 100 : 0.0
+    hadPriorRun := priorRunGain >= priorRunMinPct
+else if not requirePriorRun
+    hadPriorRun := true
+
+// ── Selling Climax Signature (ranking metric, not gate) ──
+crashVolSpike = rvol >= rvolThreshold and close < open
+lowerWick = math.min(open, close) - low
+barRng = math.max(high - low, syminfo.mintick)
+hammerRatio = (lowerWick / barRng) * 100
+isSellingClimax = crashVolSpike or hammerRatio > 50
+
+// ── Combined Detection ──
+washoutDetected = liquidityOk and isCrashCandidate and hadPriorRun
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 5: RUN AVWAP (Context)
+// ═══════════════════════════════════════════════════════════════════
+
+// AVWAP anchor for shorts: exact lowest bar in gain lookback
+lowestBarOffset = enoughBarsForGain ? ta.lowestbars(low, gainLookback) : 0
+advanceStartBarCalc = bar_index + lowestBarOffset
+advanceStartLowCalc = low[math.abs(lowestBarOffset)]
+
+// Short-side Run AVWAP accumulators
+var float shortAvwapNum = 0.0
+var float shortAvwapDen = 0.0
+var float shortRunAVWAP = na
+
+// Long-side Run AVWAP accumulators (anchored from peak)
+var float longAvwapNum = 0.0
+var float longAvwapDen = 0.0
+var float longRunAVWAP = na
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 6: SHORT SETUP STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════
+
+var bool  shortSetupActive   = false
+var int   shortSetupBar      = na
+var float parabolicPeak      = na
+var int   parabolicPeakBar   = na
+var float advanceStartLow    = na
+var int   advanceStartBar    = na
+var int   lastShortBar       = na
+var bool  shortSetupTriggered = false
+
+shortSetupTriggered := false
+
+// ── ACTIVATION ──
+if enableShort and parabolicAdvanceDetected and climaxVolOk and not shortSetupActive and (na(lastShortBar) or bar_index - lastShortBar > cooldownBars)
+    shortSetupActive := true
+    shortSetupBar    := bar_index
+    parabolicPeak    := high
+    parabolicPeakBar := bar_index
+    advanceStartBar  := advanceStartBarCalc
+    advanceStartLow  := advanceStartLowCalc
+    // Initialize AVWAP accumulation (Section 14.1)
+    shortAvwapNum    := 0.0
+    shortAvwapDen    := 0.0
+    shortRunAVWAP    := na
+
+// ── PEAK TRACKING ──
+if shortSetupActive and high > parabolicPeak
+    parabolicPeak    := high
+    parabolicPeakBar := bar_index
+
+// ── AVWAP ACCUMULATION ──
+if shortSetupActive and not na(advanceStartBar) and bar_index >= advanceStartBar
+    src = ohlc4
+    shortAvwapNum += src * volume
+    shortAvwapDen += volume
+    shortRunAVWAP := shortAvwapDen > 0 ? shortAvwapNum / shortAvwapDen : na
+
+// ── TRIGGER ──
+setupMature = not na(shortSetupBar) and (bar_index - shortSetupBar) >= minBarsAfterSetup
+
+shortEntryProxy = switch shortTrigger
+    "First Red Day"      => close < open and close < close[1]
+    "Close < Prior Low"  => close < low[1]
+    "Close < Run AVWAP"  => not na(shortRunAVWAP) and close < shortRunAVWAP
+    "Any Reversal"       => (close < low[1]) or (close < open and close < close[1]) or (not na(shortRunAVWAP) and close < shortRunAVWAP)
+    => false
+
+// Close strength for shorts: close near low = strong red candle
+barRngShort = math.max(high - low, syminfo.mintick)
+shortCloseStr = (high - close) / barRngShort
+shortCloseOk  = shortCloseStr >= minCloseStrength
+
+// Short stop price (computed early for ADR gate)
+shortStopPrice = switch shortStopMode
+    "Run Peak"         => nz(parabolicPeak, high) * (1 + stopBuffer / 100)
+    "Trigger Bar High" => high * (1 + stopBuffer / 100)
+    "ATR Based"        => close + (ta.atr(atrLen) * atrMult)
+    => high * (1 + stopBuffer / 100)
+
+shortStopWidth = close > 0 ? math.abs(shortStopPrice - close) / close * 100 : 0.0
+shortAdrOk = useADRFilter ? (nz(adrPct, 100) > 0 and shortStopWidth <= (nz(adrPct, 100) * maxStopVsADR)) : true
+
+shortSetupTriggered := shortSetupActive and setupMature and shortEntryProxy and shortCloseOk and shortAdrOk
+
+// ── RESET on trigger ──
+if shortSetupTriggered
+    shortSetupActive := false
+    lastShortBar     := bar_index
+    // Section 14.1: Clear AVWAP accumulators
+    shortRunAVWAP    := na
+    shortAvwapNum    := 0.0
+    shortAvwapDen    := 0.0
+
+// ── TIMEOUT ──
+if shortSetupActive and not na(shortSetupBar) and (bar_index - shortSetupBar > shortSetupTimeout)
+    shortSetupActive := false
+    // Section 14.1: Clear AVWAP accumulators
+    shortRunAVWAP    := na
+    shortAvwapNum    := 0.0
+    shortAvwapDen    := 0.0
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 7: LONG SETUP STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════
+
+var bool  longSetupActive   = false
+var int   longSetupBar      = na
+var float washoutLow        = na
+var int   washoutLowBar     = na
+var int   lastLongBar       = na
+var bool  longSetupTriggered = false
+
+longSetupTriggered := false
+
+// ── ACTIVATION ──
+if enableLong and washoutDetected and not longSetupActive and (na(lastLongBar) or bar_index - lastLongBar > cooldownBars)
+    longSetupActive := true
+    longSetupBar    := bar_index
+    washoutLow      := low
+    washoutLowBar   := bar_index
+    // Initialize long-side AVWAP from peak (Section 14.1)
+    longAvwapNum    := 0.0
+    longAvwapDen    := 0.0
+    longRunAVWAP    := na
+
+// ── LOW TRACKING ──
+if longSetupActive and low < washoutLow
+    washoutLow    := low
+    washoutLowBar := bar_index
+
+// ── AVWAP ACCUMULATION (anchored from peak) ──
+if longSetupActive and not na(peakBarIdx) and bar_index >= peakBarIdx
+    src = ohlc4
+    longAvwapNum += src * volume
+    longAvwapDen += volume
+    longRunAVWAP := longAvwapDen > 0 ? longAvwapNum / longAvwapDen : na
+
+// ── TRIGGER ──
+longSetupMature = not na(longSetupBar) and (bar_index - longSetupBar) >= minBarsAfterSetup
+
+longEntryProxy = switch longTrigger
+    "First Green Day"    => close > open and close > close[1]
+    "Close > Prior High" => close > high[1]
+    "Close > Run AVWAP"  => not na(longRunAVWAP) and close > longRunAVWAP
+    "Any Reversal"       => (close > high[1]) or (close > open and close > close[1])
+    => false
+
+barRngLong = math.max(high - low, syminfo.mintick)
+longCloseStr = (close - low) / barRngLong
+longCloseOk  = longCloseStr >= minCloseStrength
+
+// Long stop price (computed early for ADR gate)
+longStopPrice = switch longStopMode
+    "Washout Low" => nz(washoutLow, low) * (1 - stopBuffer / 100)
+    "ATR Based"   => close - (ta.atr(atrLen) * atrMult)
+    => nz(washoutLow, low) * (1 - stopBuffer / 100)
+
+longStopWidth = close > 0 ? math.abs(close - longStopPrice) / close * 100 : 0.0
+longAdrOk = useADRFilter ? (nz(adrPct, 100) > 0 and longStopWidth <= (nz(adrPct, 100) * maxStopVsADR)) : true
+
+longSetupTriggered := longSetupActive and longSetupMature and longEntryProxy and longCloseOk and longAdrOk
+
+// ── RESET on trigger ──
+if longSetupTriggered
+    longSetupActive := false
+    lastLongBar     := bar_index
+    // Section 14.1: Clear AVWAP accumulators
+    longRunAVWAP    := na
+    longAvwapNum    := 0.0
+    longAvwapDen    := 0.0
+
+// ── TIMEOUT ──
+if longSetupActive and not na(longSetupBar) and (bar_index - longSetupBar > longSetupTimeout)
+    longSetupActive := false
+    // Section 14.1: Clear AVWAP accumulators
+    longRunAVWAP    := na
+    longAvwapNum    := 0.0
+    longAvwapDen    := 0.0
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 8: RISK MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Target Calculation ──
+targetFast = ta.sma(close, targetMA_Fast)
+targetSlow = ta.sma(close, targetMA_Slow)
+
+// Short entries
+shortEntry = close
+shortRiskPct = close > 0 ? ((shortStopPrice - shortEntry) / shortEntry) * 100 : 0.0
+
+shortRewardPctFast = shortEntry > 0 ? ((shortEntry - targetFast) / shortEntry) * 100 : 0.0
+shortRewardPctSlow = shortEntry > 0 ? ((shortEntry - targetSlow) / shortEntry) * 100 : 0.0
+
+shortR_Fast = shortRiskPct > 0 ? shortRewardPctFast / shortRiskPct : 0.0
+shortR_Slow = shortRiskPct > 0 ? shortRewardPctSlow / shortRiskPct : 0.0
+
+// Long entries
+longEntry = close
+longRiskPct = close > 0 ? ((longEntry - longStopPrice) / longEntry) * 100 : 0.0
+
+longRewardPctFast = longEntry > 0 ? ((targetFast - longEntry) / longEntry) * 100 : 0.0
+longRewardPctSlow = longEntry > 0 ? ((targetSlow - longEntry) / longEntry) * 100 : 0.0
+
+longR_Fast = longRiskPct > 0 ? longRewardPctFast / longRiskPct : 0.0
+longR_Slow = longRiskPct > 0 ? longRewardPctSlow / longRiskPct : 0.0
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 9: VISUALS
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Bar Coloring ──
+barcolor(shortSetupTriggered ? color.red : longSetupTriggered ? color.blue : na)
+
+// ── Unified Run AVWAP ──
+runAVWAP = shortSetupActive ? shortRunAVWAP : longSetupActive ? longRunAVWAP : na
+
+// ── Setup Labels ──
+if shortSetupTriggered
+    label.new(bar_index, high, text=
+     "⬇ SHORT SETUP\n" +
+     "Entry Zone: " + str.tostring(close, format.mintick) + "\n" +
+     "Stop: " + str.tostring(shortStopPrice, format.mintick) + " (" + shortStopMode + ")\n" +
+     "Target₁: " + str.tostring(targetFast, format.mintick) + " (10 MA)\n" +
+     "Target₂: " + str.tostring(targetSlow, format.mintick) + " (20 MA)\n" +
+     "Risk: " + str.tostring(shortRiskPct, "#.##") + "%\n" +
+     "R (10MA): " + str.tostring(shortR_Fast, "#.##") + "x\n" +
+     "R (20MA): " + str.tostring(shortR_Slow, "#.##") + "x\n" +
+     "RVOL: " + str.tostring(rvol, "#.##") + "x\n" +
+     "Ext: " + str.tostring(extensionPct, "#.##") + "% > MA" + str.tostring(extMA_Len) + "\n" +
+     "Green Streak: " + str.tostring(greenStreak) + "d",
+     style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+
+if longSetupTriggered
+    label.new(bar_index, low, text=
+     "⬆ WASHOUT SETUP\n" +
+     "Entry Zone: " + str.tostring(close, format.mintick) + "\n" +
+     "Stop: " + str.tostring(longStopPrice, format.mintick) + " (" + longStopMode + ")\n" +
+     "Target₁: " + str.tostring(targetFast, format.mintick) + " (10 MA)\n" +
+     "Target₂: " + str.tostring(targetSlow, format.mintick) + " (20 MA)\n" +
+     "Risk: " + str.tostring(longRiskPct, "#.##") + "%\n" +
+     "R (10MA): " + str.tostring(longR_Fast, "#.##") + "x\n" +
+     "R (20MA): " + str.tostring(longR_Slow, "#.##") + "x\n" +
+     "Crash: " + str.tostring(crashFromPeak, "#.##") + "% in " + str.tostring(barsFromPeak) + "d\n" +
+     "RVOL: " + str.tostring(rvol, "#.##") + "x",
+     style=label.style_label_up, color=color.blue, textcolor=color.white, size=size.small)
+
+// ── Stop Lines (extending rightward, turn dashed if breached) ──
+var line[] shortStopLines = array.new_line()
+var int[]  shortStopBars  = array.new_int()
+var line[] longStopLines  = array.new_line()
+var int[]  longStopBars   = array.new_int()
+
+if shortSetupTriggered
+    newLine = line.new(bar_index, shortStopPrice, bar_index + 1, shortStopPrice, color=color.red, width=2, extend=extend.none)
+    array.push(shortStopLines, newLine)
+    array.push(shortStopBars, bar_index)
+
+if longSetupTriggered
+    newLine = line.new(bar_index, longStopPrice, bar_index + 1, longStopPrice, color=color.green, width=2, extend=extend.none)
+    array.push(longStopLines, newLine)
+    array.push(longStopBars, bar_index)
+
+// Manage stop lines: extend, check breach, expire
+if array.size(shortStopLines) > 0
+    for i = array.size(shortStopLines) - 1 to 0
+        ln = array.get(shortStopLines, i)
+        startBar = array.get(shortStopBars, i)
+        age = bar_index - startBar
+        stopLvl = line.get_y1(ln)
+        if age > maxLineAge
+            line.delete(ln)
+            array.remove(shortStopLines, i)
+            array.remove(shortStopBars, i)
+        else
+            line.set_x2(ln, bar_index)
+            if close > stopLvl
+                line.set_style(ln, line.style_dashed)
+                line.set_color(ln, color.new(color.red, 60))
+
+if array.size(longStopLines) > 0
+    for i = array.size(longStopLines) - 1 to 0
+        ln = array.get(longStopLines, i)
+        startBar = array.get(longStopBars, i)
+        age = bar_index - startBar
+        stopLvl = line.get_y1(ln)
+        if age > maxLineAge
+            line.delete(ln)
+            array.remove(longStopLines, i)
+            array.remove(longStopBars, i)
+        else
+            line.set_x2(ln, bar_index)
+            if close < stopLvl
+                line.set_style(ln, line.style_dashed)
+                line.set_color(ln, color.new(color.green, 60))
+
+// ── Target MA Lines ──
+plot(showTargetLines and (targetMode == "10 MA" or targetMode == "Dual (10 & 20)") ? targetFast : na, "Target 10 MA", color.orange, linewidth=1)
+plot(showTargetLines and (targetMode == "20 MA" or targetMode == "Dual (10 & 20)") ? targetSlow : na, "Target 20 MA", color.yellow, linewidth=1)
+
+// ── Run AVWAP (Context) ──
+avwapColor = close > nz(runAVWAP, close) ? color.new(color.teal, 30) : color.new(color.red, 30)
+plot(showRunAVWAP and (shortSetupActive or longSetupActive) ? runAVWAP : na, "Run AVWAP (Context)", avwapColor, linewidth=2)
+
+// ── Background Shading ──
+bgcolor(shortSetupActive and not shortSetupTriggered ? color.new(color.red, 93) : na)
+bgcolor(longSetupActive and not longSetupTriggered ? color.new(color.green, 93) : na)
+
+// ── Climax Marker ──
+if parabolicAdvanceDetected and climaxVolOk
+    label.new(bar_index, high, text="🔥", style=label.style_none, textcolor=color.orange, size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 10: PINE SCREENER OUTPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+// Setup State
+plot(shortSetupTriggered ? 1 : 0,       title="SCR: Short Setup Triggered",      display=display.none)
+plot(longSetupTriggered ? 1 : 0,        title="SCR: Long Setup Triggered",       display=display.none)
+plot(shortSetupActive ? 1 : 0,          title="SCR: Short Setup Active",         display=display.none)
+plot(longSetupActive ? 1 : 0,           title="SCR: Long Setup Active",          display=display.none)
+plot(parabolicAdvanceDetected ? 1 : 0,  title="SCR: Parabolic Advance Detected", display=display.none)
+plot(washoutDetected ? 1 : 0,           title="SCR: Washout Detected",           display=display.none)
+
+// Ranking Metrics
+plot(extensionPct,                       title="SCR: Extension Above MA %",       display=display.none)
+plot(greenStreak,                        title="SCR: Consecutive Green Days",     display=display.none)
+plot(rvol,                               title="SCR: Relative Volume (RVOL)",     display=display.none)
+plot(rollingGainPct,                     title="SCR: Rolling Gain %",             display=display.none)
+plot(crashFromPeak,                      title="SCR: Crash From Peak %",          display=display.none)
+plot(isSellingClimax ? 1 : 0,            title="SCR: Selling Climax Detected",    display=display.none)
+plot(hammerRatio,                         title="SCR: Hammer Ratio %",              display=display.none)
+plot(volExpansionScore,                   title="SCR: Streak Vol Expansion Score",  display=display.none)
+
+// Liquidity
+plot(avgDollarVol,                       title="SCR: Avg Dollar Vol (M)",         display=display.none)
+
+// Setup Age
+shortSetupAge = shortSetupActive ? bar_index - shortSetupBar : 0
+longSetupAge  = longSetupActive  ? bar_index - longSetupBar  : 0
+plot(shortSetupAge,                      title="SCR: Short Setup Age",            display=display.none)
+plot(longSetupAge,                       title="SCR: Long Setup Age",             display=display.none)
+
+// Risk Metrics
+plot(shortSetupTriggered ? shortRiskPct : 0,  title="SCR: Short Risk %",          display=display.none)
+plot(longSetupTriggered ? longRiskPct : 0,    title="SCR: Long Risk %",           display=display.none)
+plot(shortSetupTriggered ? shortR_Fast : 0,   title="SCR: Short R (10MA)",        display=display.none)
+plot(shortSetupTriggered ? shortR_Slow : 0,   title="SCR: Short R (20MA)",        display=display.none)
+plot(longSetupTriggered ? longR_Fast : 0,     title="SCR: Long R (10MA)",         display=display.none)
+plot(longSetupTriggered ? longR_Slow : 0,     title="SCR: Long R (20MA)",         display=display.none)
+plot(adrPct,                                  title="SCR: ADR %",                 display=display.none)
+
+// Distance / Proximity Metrics
+pctFromRunAVWAP = not na(runAVWAP) and runAVWAP > 0 ? ((close - runAVWAP) / runAVWAP) * 100 : 0.0
+plot(pctFromRunAVWAP,                    title="SCR: % from Run AVWAP",           display=display.none)
+
+pctFromTarget10 = targetFast > 0 ? ((close - targetFast) / targetFast) * 100 : 0.0
+pctFromTarget20 = targetSlow > 0 ? ((close - targetSlow) / targetSlow) * 100 : 0.0
+plot(pctFromTarget10,                    title="SCR: % from 10 MA",               display=display.none)
+plot(pctFromTarget20,                    title="SCR: % from 20 MA",               display=display.none)
+
+plot(shortSetupTriggered ? shortRiskPct : longSetupTriggered ? longRiskPct : 0, title="SCR: Stop Width %", display=display.none)
+
+// Approaching Setup Zones
+approachingParabolic = rollingGainPct >= (gainThreshold * 0.8) and rollingGainPct < gainThreshold and greenStreak >= minGreenDays - 1
+plot(approachingParabolic ? 1 : 0,       title="SCR: Approaching Parabolic",      display=display.none)
+
+extensionHeating = extensionPct >= (minExtAboveMA * 0.7) and extensionPct < minExtAboveMA
+plot(extensionHeating ? 1 : 0,           title="SCR: Extension Heating Up",       display=display.none)
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 11: ALERTS
+// ═══════════════════════════════════════════════════════════════════
+
+alertcondition(shortSetupTriggered,                              "Short Setup Triggered — Review Intraday")
+alertcondition(longSetupTriggered,                               "Washout Setup Triggered — Review Intraday")
+alertcondition(parabolicAdvanceDetected and climaxVolOk,         "Parabolic Climax Detected — Watch for Reversal")
+alertcondition(washoutDetected,                                  "Washout Crash Detected — Watch for Bounce")
+alertcondition(shortSetupActive,                                 "Short Setup Active — Awaiting Trigger")
+alertcondition(longSetupActive,                                  "Long Setup Active — Awaiting Trigger")
+alertcondition(approachingParabolic,                             "Approaching Parabolic Threshold")
