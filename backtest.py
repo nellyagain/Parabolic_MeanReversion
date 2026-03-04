@@ -1393,14 +1393,7 @@ def run_walk_forward(csv_files: list, n_slices: int = 4, cfg: 'Config' = None):
     from dataclasses import replace
 
     if cfg is None:
-        cfg = Config(
-            short_stop_mode="Run Peak",
-            long_stop_mode="ATR Based",
-            atr_mult=2.5,
-            crash_velocity_min=3.0,
-            require_selling_climax=True,
-            selling_climax_rvol=3.0,
-        )
+        cfg = Config()  # Use base Config defaults (V4 optimal)
 
     # Preload all bar data
     ticker_bars = []
