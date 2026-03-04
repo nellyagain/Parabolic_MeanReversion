@@ -2,9 +2,9 @@
 """
 Parabolic Snapback & Washout [Daily Screener V1] — Comprehensive Backtester
 
-Replicates the Pine Script V1 logic from the architecture plan against CSV OHLC data.
-Since the chart data has no volume column, volume-dependent gates (climax volume,
-RVOL, dollar volume filter) are bypassed. All price-based detection, state machines,
+Replicates the Pine Script V1 logic from the architecture plan against CSV OHLCV data.
+Includes volume-dependent gates (climax volume via RVOL, dollar volume filter) and
+Run AVWAP trigger modes matching the Pine Script. All detection, state machines,
 triggers, risk management, and targets operate identically to the Pine Script.
 
 Trade outcome tracking:
@@ -48,23 +48,28 @@ class Config:
     use_ext_bb_filter: bool = False
     bb_dev_mult: float = 3.0
 
-    # Parabolic LONG — Washout Detection
+    # Parabolic LONG — Washout Detection (V2: velocity + selling climax)
     enable_long: bool = True
     min_crash_pct: float = 30.0       # Calibrated for large-cap (plan default: 50)
     crash_window: int = 15            # Wider window for large-cap crashes (plan default: 5)
+    crash_velocity_min: float = 3.0   # V4: Min crash speed %/bar (sweep optimal: 3.0)
+    require_selling_climax: bool = True  # Require capitulation volume during crash
+    selling_climax_rvol: float = 3.0  # V4: RVOL threshold for selling climax (sweep optimal: 3.0)
     require_prior_run: bool = True
     prior_run_min_pct: float = 40.0   # Calibrated for large-cap (plan default: 100)
     prior_run_lookback: int = 60      # Wider lookback (plan default: 40)
 
-    # Climax Volume (bypassed — no volume data)
-    use_climax_vol: bool = False  # Disabled for backtest
+    # Climax Volume
+    use_climax_vol: bool = False      # V4: disabled — kills too many SHORT setups without improving quality
     rvol_threshold: float = 3.0
     rvol_baseline: int = 20
     climax_window_bars: int = 1
 
-    # Liquidity Filters (price-only; dollar vol bypassed)
+    # Liquidity Filters
     min_price: float = 5.0
     min_adr_pct: float = 1.0         # Lowered for stable large-caps (plan default: 2)
+    min_avg_dollar_vol: float = 0.0   # V4: disabled — reduces setup count without improving edge
+    dollar_vol_len: int = 20
 
     # Setup Trigger (Daily Proxy)
     short_trigger: str = "Close < Prior Low"
@@ -79,18 +84,22 @@ class Config:
     use_trend_filter: bool = False
     trend_ma_len: int = 50
 
+    # Split Exit — partial at 10MA, runner to 20MA with breakeven stop
+    split_exit: bool = True
+    split_pct: float = 50.0  # % of position to close at 10MA; rest runs to 20MA
+
     # Quality Gates
     min_close_strength: float = 0.0
     use_adr_filter: bool = True
     adr_len: int = 20
-    max_stop_vs_adr: float = 2.5     # Relaxed for parabolic peaks (plan default: 1.0)
+    max_stop_vs_adr: float = 1.5     # Tightened from 2.5x for loss containment (plan default: 1.0)
 
     # Risk Management
-    short_stop_mode: str = "Run Peak"
-    long_stop_mode: str = "Washout Low"
+    short_stop_mode: str = "Run Peak"    # V4: Run Peak best for shorts (ATR too tight for parabolic vol)
+    long_stop_mode: str = "ATR Based"    # V4: ATR-based (Washout Low too wide)
     stop_buffer: float = 0.2
     atr_len: int = 14
-    atr_mult: float = 2.0
+    atr_mult: float = 1.0           # V4: 1.0x ATR optimal for LONG washout bounce stops
 
     # Timeouts & Cooldown
     short_setup_timeout: int = 10     # More time for reversal (plan default: 5)
@@ -113,6 +122,7 @@ class Bar:
     high: float
     low: float
     close: float
+    volume: float = 0.0
     ohlc4: float = 0.0
 
     def __post_init__(self):
@@ -132,10 +142,12 @@ class Trade:
     exit_bar: int = -1
     exit_date: str = ""
     exit_price: float = 0.0
-    exit_reason: str = ""  # "STOP", "TARGET_10MA", "TARGET_20MA", "TIMEOUT"
+    exit_reason: str = ""  # "STOP", "TARGET_10MA", "TARGET_10MA_PARTIAL", "TARGET_20MA", "STOP_BREAKEVEN", "TIMEOUT"
     pnl_pct: float = 0.0
     r_multiple: float = 0.0
     bars_held: int = 0
+    weight: float = 1.0  # Position weight (1.0 = full, 0.5 = half for split exits)
+    is_runner: bool = False  # True for runner leg of split exit
     # Context metrics at entry
     extension_pct: float = 0.0
     rolling_gain_pct: float = 0.0
@@ -183,13 +195,22 @@ def bb_upper(closes: list, length: int, mult: float) -> float:
 
 
 def load_csv(filepath: str) -> list:
-    """Load OHLC CSV data into Bar objects."""
+    """Load OHLCV CSV data into Bar objects."""
     bars = []
     with open(filepath, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
             ts = int(row['time'])
             dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            # Volume column may be 'Volume' or 'volume'
+            vol = 0.0
+            for vk in ('Volume', 'volume', 'vol'):
+                if vk in row:
+                    try:
+                        vol = float(row[vk])
+                    except (ValueError, TypeError):
+                        pass
+                    break
             bars.append(Bar(
                 timestamp=ts,
                 date=dt.strftime('%Y-%m-%d'),
@@ -197,6 +218,7 @@ def load_csv(filepath: str) -> list:
                 high=float(row['high']),
                 low=float(row['low']),
                 close=float(row['close']),
+                volume=vol,
             ))
     return bars
 
@@ -229,6 +251,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
     closes = []
     highs = []
     lows = []
+    volumes = []
+    dollar_vols = []  # close * volume per bar
     daily_range_pcts = []
 
     # Short state machine
@@ -247,6 +271,19 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
     washout_low_bar = -1
     last_long_bar = -999
 
+    # Climax volume tracking
+    last_climax_bar = -999
+    last_selling_climax_bar = -999  # For washout detection: high vol + red candle
+
+    # Run AVWAP accumulators
+    short_avwap_num = 0.0
+    short_avwap_den = 0.0
+    short_run_avwap = 0.0
+    long_avwap_num = 0.0
+    long_avwap_den = 0.0
+    long_run_avwap = 0.0
+    long_peak_bar_idx = -1  # for AVWAP anchor
+
     # Green streak
     green_streak = 0
 
@@ -258,6 +295,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
         closes.append(bar.close)
         highs.append(bar.high)
         lows.append(bar.low)
+        volumes.append(bar.volume)
+        dollar_vols.append(bar.close * bar.volume)
 
         # ── Track open trades ──
         new_open_trades = []
@@ -268,27 +307,69 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 continue
 
             if t.direction == "SHORT":
-                # Check stop (price went above stop)
-                if bar.high >= t.stop_price:
+                # Determine if both stop and target are hit on same bar
+                stop_hit = bar.high >= t.stop_price
+                tgt_fast_hit = not t.is_runner and bar.low <= t.target_fast and t.target_fast < t.entry_price
+                tgt_slow_hit = bar.low <= t.target_slow and t.target_slow < t.entry_price
+
+                # Intrabar ambiguity resolution: if both stop and target hit,
+                # use proximity to open to decide which was hit first
+                if stop_hit and (tgt_fast_hit or tgt_slow_hit):
+                    dist_to_stop = abs(t.stop_price - bar.open)
+                    tgt_price = t.target_fast if tgt_fast_hit else t.target_slow
+                    dist_to_tgt = abs(tgt_price - bar.open)
+                    if dist_to_tgt <= dist_to_stop:
+                        stop_hit = False  # target was closer to open, hit first
+                    else:
+                        tgt_fast_hit = False
+                        tgt_slow_hit = False
+
+                if stop_hit:
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = t.stop_price
-                    t.exit_reason = "STOP"
+                    t.exit_reason = "STOP_BREAKEVEN" if t.is_runner else "STOP"
                     t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
                     t.bars_held = bars_held
                     if t.risk_pct > 0:
                         t.r_multiple = t.pnl_pct / t.risk_pct
-                # Check target (price reached 10 MA or 20 MA — below entry for shorts)
-                elif bar.low <= t.target_fast and t.target_fast < t.entry_price:
-                    t.exit_bar = i
-                    t.exit_date = bar.date
-                    t.exit_price = t.target_fast
-                    t.exit_reason = "TARGET_10MA"
-                    t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
-                    t.bars_held = bars_held
-                    if t.risk_pct > 0:
-                        t.r_multiple = t.pnl_pct / t.risk_pct
-                elif bar.low <= t.target_slow and t.target_slow < t.entry_price:
+                elif tgt_fast_hit:
+                    if cfg.split_exit:
+                        t.exit_bar = i
+                        t.exit_date = bar.date
+                        t.exit_price = t.target_fast
+                        t.exit_reason = "TARGET_10MA_PARTIAL"
+                        t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
+                        t.bars_held = bars_held
+                        t.weight = cfg.split_pct / 100.0
+                        if t.risk_pct > 0:
+                            t.r_multiple = t.pnl_pct / t.risk_pct
+                        runner = Trade(
+                            ticker=t.ticker, direction="SHORT",
+                            entry_bar=t.entry_bar, entry_date=t.entry_date,
+                            entry_price=t.entry_price,
+                            stop_price=t.entry_price,
+                            target_fast=t.target_fast,
+                            target_slow=t.target_slow,
+                            extension_pct=t.extension_pct,
+                            rolling_gain_pct=t.rolling_gain_pct,
+                            green_streak=t.green_streak,
+                            risk_pct=t.risk_pct,
+                            weight=1.0 - cfg.split_pct / 100.0,
+                            is_runner=True,
+                        )
+                        trades.append(runner)
+                        new_open_trades.append(runner)
+                    else:
+                        t.exit_bar = i
+                        t.exit_date = bar.date
+                        t.exit_price = t.target_fast
+                        t.exit_reason = "TARGET_10MA"
+                        t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
+                        t.bars_held = bars_held
+                        if t.risk_pct > 0:
+                            t.r_multiple = t.pnl_pct / t.risk_pct
+                elif tgt_slow_hit:
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = t.target_slow
@@ -311,27 +392,66 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     continue
 
             elif t.direction == "LONG":
-                # Check stop (price went below stop)
-                if bar.low <= t.stop_price:
+                # Determine if both stop and target are hit on same bar
+                stop_hit = bar.low <= t.stop_price
+                tgt_fast_hit = not t.is_runner and bar.high >= t.target_fast and t.target_fast > t.entry_price
+                tgt_slow_hit = bar.high >= t.target_slow and t.target_slow > t.entry_price
+
+                # Intrabar ambiguity resolution
+                if stop_hit and (tgt_fast_hit or tgt_slow_hit):
+                    dist_to_stop = abs(t.stop_price - bar.open)
+                    tgt_price = t.target_fast if tgt_fast_hit else t.target_slow
+                    dist_to_tgt = abs(tgt_price - bar.open)
+                    if dist_to_tgt <= dist_to_stop:
+                        stop_hit = False
+                    else:
+                        tgt_fast_hit = False
+                        tgt_slow_hit = False
+
+                if stop_hit:
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = t.stop_price
-                    t.exit_reason = "STOP"
+                    t.exit_reason = "STOP_BREAKEVEN" if t.is_runner else "STOP"
                     t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
                     t.bars_held = bars_held
                     if t.risk_pct > 0:
                         t.r_multiple = t.pnl_pct / t.risk_pct
-                # Check target (price reached 10 MA or 20 MA — above entry for longs)
-                elif bar.high >= t.target_fast and t.target_fast > t.entry_price:
-                    t.exit_bar = i
-                    t.exit_date = bar.date
-                    t.exit_price = t.target_fast
-                    t.exit_reason = "TARGET_10MA"
-                    t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
-                    t.bars_held = bars_held
-                    if t.risk_pct > 0:
-                        t.r_multiple = t.pnl_pct / t.risk_pct
-                elif bar.high >= t.target_slow and t.target_slow > t.entry_price:
+                elif tgt_fast_hit:
+                    if cfg.split_exit:
+                        t.exit_bar = i
+                        t.exit_date = bar.date
+                        t.exit_price = t.target_fast
+                        t.exit_reason = "TARGET_10MA_PARTIAL"
+                        t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
+                        t.bars_held = bars_held
+                        t.weight = cfg.split_pct / 100.0
+                        if t.risk_pct > 0:
+                            t.r_multiple = t.pnl_pct / t.risk_pct
+                        runner = Trade(
+                            ticker=t.ticker, direction="LONG",
+                            entry_bar=t.entry_bar, entry_date=t.entry_date,
+                            entry_price=t.entry_price,
+                            stop_price=t.entry_price,
+                            target_fast=t.target_fast,
+                            target_slow=t.target_slow,
+                            crash_from_peak=t.crash_from_peak,
+                            risk_pct=t.risk_pct,
+                            weight=1.0 - cfg.split_pct / 100.0,
+                            is_runner=True,
+                        )
+                        trades.append(runner)
+                        new_open_trades.append(runner)
+                    else:
+                        t.exit_bar = i
+                        t.exit_date = bar.date
+                        t.exit_price = t.target_fast
+                        t.exit_reason = "TARGET_10MA"
+                        t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
+                        t.bars_held = bars_held
+                        if t.risk_pct > 0:
+                            t.r_multiple = t.pnl_pct / t.risk_pct
+                elif tgt_slow_hit:
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = t.target_slow
@@ -373,11 +493,14 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
             continue
 
         # ═══════════════════════════════════════════════════════════
-        # LIQUIDITY GATE (price-only, no volume data)
+        # LIQUIDITY GATE
         # ═══════════════════════════════════════════════════════════
         adr_pct = sma(daily_range_pcts, cfg.adr_len)
+        avg_dollar_vol = sma(dollar_vols, cfg.dollar_vol_len) / 1e6  # in millions
 
-        liquidity_ok = bar.close >= cfg.min_price and adr_pct >= cfg.min_adr_pct
+        liquidity_ok = (bar.close >= cfg.min_price
+                        and adr_pct >= cfg.min_adr_pct
+                        and avg_dollar_vol >= cfg.min_avg_dollar_vol)
 
         # ═══════════════════════════════════════════════════════════
         # PARABOLIC ADVANCE DETECTION
@@ -416,28 +539,64 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                                       has_green_streak and is_extended and
                                       bb_ok and trend_ok)
 
-        # Climax volume bypassed (no volume data)
-        climax_vol_ok = True
+        # ═══════════════════════════════════════════════════════════
+        # CLIMAX VOLUME DETECTION
+        # ═══════════════════════════════════════════════════════════
+        vol_baseline = sma(volumes, cfg.rvol_baseline)
+        rvol = bar.volume / vol_baseline if vol_baseline > 0 else 0.0
+        is_climax_volume = rvol >= cfg.rvol_threshold
+
+        if is_climax_volume:
+            last_climax_bar = i
+
+        # Selling climax: high volume + red candle (for washout detection)
+        is_selling_climax_bar = rvol >= cfg.selling_climax_rvol and bar.close < bar.open
+        if is_selling_climax_bar:
+            last_selling_climax_bar = i
+
+        # Gate: climax must be within N bars of current bar
+        climax_aligned = (i - last_climax_bar) <= cfg.climax_window_bars
+        climax_vol_ok = climax_aligned if cfg.use_climax_vol else True
 
         # ═══════════════════════════════════════════════════════════
-        # WASHOUT CRASH DETECTION (Long Side)
+        # WASHOUT CRASH DETECTION (Long Side) — V2: Velocity + Selling Climax
         # ═══════════════════════════════════════════════════════════
         crash_from_peak = 0.0
+        crash_velocity = 0.0
         bars_from_peak = 0
         is_crash_candidate = False
         had_prior_run = True
+        peak_bar_idx = -1
 
         if enough_bars_peak:
-            # Find recent peak
+            # Find recent peak (use last/most-recent occurrence to match Pine's ta.highestbars)
             peak_window = highs[max(0, i - cfg.prior_run_lookback + 1):i + 1]
             peak_high = max(peak_window)
-            peak_offset = len(peak_window) - 1 - peak_window.index(peak_high)
+            # Reverse search: find last occurrence (most recent bar with this high)
+            last_idx = len(peak_window) - 1
+            for pi in range(last_idx, -1, -1):
+                if peak_window[pi] == peak_high:
+                    last_idx = pi
+                    break
+            peak_offset = len(peak_window) - 1 - last_idx
             peak_bar_idx = i - peak_offset
 
             bars_from_peak = i - peak_bar_idx
             crash_from_peak = ((peak_high - bar.close) / peak_high) * 100 if peak_high > 0 else 0.0
 
-            is_crash_candidate = crash_from_peak >= cfg.min_crash_pct and bars_from_peak <= cfg.crash_window
+            # V2: Velocity gate — crash must be fast enough (% per bar)
+            crash_velocity = crash_from_peak / max(bars_from_peak, 1)
+            is_velocity_crash = (crash_from_peak >= cfg.min_crash_pct
+                                 and crash_velocity >= cfg.crash_velocity_min
+                                 and bars_from_peak <= cfg.crash_window)
+
+            # V2: Selling climax gate — require capitulation volume during crash
+            has_selling_climax = True
+            if cfg.require_selling_climax:
+                # Check if any selling climax bar occurred between peak and now
+                has_selling_climax = last_selling_climax_bar >= peak_bar_idx
+
+            is_crash_candidate = is_velocity_crash and has_selling_climax
 
             # Prior run verification
             if cfg.require_prior_run and is_crash_candidate:
@@ -467,11 +626,22 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
             # AVWAP anchor
             advance_start_low = recent_low
             advance_start_bar = i - cfg.gain_lookback + 1 + (window_lows.index(recent_low) if recent_low in window_lows else 0)
+            # Initialize Run AVWAP accumulators
+            short_avwap_num = 0.0
+            short_avwap_den = 0.0
+            short_run_avwap = 0.0
 
         # PEAK TRACKING
         if short_setup_active and bar.high > parabolic_peak:
             parabolic_peak = bar.high
             parabolic_peak_bar = i
+
+        # Run AVWAP accumulation (short side)
+        if short_setup_active:
+            src = bar.ohlc4
+            short_avwap_num += src * bar.volume
+            short_avwap_den += bar.volume
+            short_run_avwap = short_avwap_num / short_avwap_den if short_avwap_den > 0 else 0.0
 
         # TRIGGER
         if short_setup_active and (i - short_setup_bar) >= cfg.min_bars_after_setup:
@@ -480,10 +650,13 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 short_entry_proxy = bar.close < bar.open and i > 0 and bar.close < bars[i - 1].close
             elif cfg.short_trigger == "Close < Prior Low":
                 short_entry_proxy = i > 0 and bar.close < bars[i - 1].low
+            elif cfg.short_trigger == "Close < Run AVWAP":
+                short_entry_proxy = short_run_avwap > 0 and bar.close < short_run_avwap
             elif cfg.short_trigger == "Any Reversal":
                 short_entry_proxy = (
                     (i > 0 and bar.close < bars[i - 1].low) or
-                    (bar.close < bar.open and i > 0 and bar.close < bars[i - 1].close)
+                    (bar.close < bar.open and i > 0 and bar.close < bars[i - 1].close) or
+                    (short_run_avwap > 0 and bar.close < short_run_avwap)
                 )
             # Close strength
             bar_rng = max(bar.high - bar.low, 0.0001)
@@ -500,7 +673,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
 
             short_stop_width = abs(short_stop - bar.close) / bar.close * 100 if bar.close > 0 else 0.0
             short_adr_ok = True
-            if cfg.use_adr_filter and adr_pct > 0:
+            # ADR filter is redundant when ATR-based (ATR mult IS the risk control)
+            if cfg.use_adr_filter and adr_pct > 0 and cfg.short_stop_mode != "ATR Based":
                 short_adr_ok = short_stop_width <= (adr_pct * cfg.max_stop_vs_adr)
 
             if short_entry_proxy and short_close_ok and short_adr_ok:
@@ -531,10 +705,16 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 # Reset
                 short_setup_active = False
                 last_short_bar = i
+                short_avwap_num = 0.0
+                short_avwap_den = 0.0
+                short_run_avwap = 0.0
 
         # TIMEOUT
         if short_setup_active and (i - short_setup_bar > cfg.short_setup_timeout):
             short_setup_active = False
+            short_avwap_num = 0.0
+            short_avwap_den = 0.0
+            short_run_avwap = 0.0
 
         # ═══════════════════════════════════════════════════════════
         # LONG SETUP STATE MACHINE
@@ -548,11 +728,22 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
             long_setup_bar = i
             washout_low = bar.low
             washout_low_bar = i
+            # Initialize long-side Run AVWAP from peak
+            long_avwap_num = 0.0
+            long_avwap_den = 0.0
+            long_run_avwap = 0.0
 
         # LOW TRACKING
         if long_setup_active and bar.low < washout_low:
             washout_low = bar.low
             washout_low_bar = i
+
+        # Run AVWAP accumulation (long side, anchored from peak)
+        if long_setup_active:
+            src = bar.ohlc4
+            long_avwap_num += src * bar.volume
+            long_avwap_den += bar.volume
+            long_run_avwap = long_avwap_num / long_avwap_den if long_avwap_den > 0 else 0.0
 
         # TRIGGER
         if long_setup_active and (i - long_setup_bar) >= cfg.min_bars_after_setup:
@@ -561,10 +752,13 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 long_entry_proxy = bar.close > bar.open and i > 0 and bar.close > bars[i - 1].close
             elif cfg.long_trigger == "Close > Prior High":
                 long_entry_proxy = i > 0 and bar.close > bars[i - 1].high
+            elif cfg.long_trigger == "Close > Run AVWAP":
+                long_entry_proxy = long_run_avwap > 0 and bar.close > long_run_avwap
             elif cfg.long_trigger == "Any Reversal":
                 long_entry_proxy = (
                     (i > 0 and bar.close > bars[i - 1].high) or
-                    (bar.close > bar.open and i > 0 and bar.close > bars[i - 1].close)
+                    (bar.close > bar.open and i > 0 and bar.close > bars[i - 1].close) or
+                    (long_run_avwap > 0 and bar.close > long_run_avwap)
                 )
 
             bar_rng = max(bar.high - bar.low, 0.0001)
@@ -579,7 +773,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
 
             long_stop_width = abs(bar.close - long_stop) / bar.close * 100 if bar.close > 0 else 0.0
             long_adr_ok = True
-            if cfg.use_adr_filter and adr_pct > 0:
+            # ADR filter is redundant when ATR-based (ATR mult IS the risk control)
+            if cfg.use_adr_filter and adr_pct > 0 and cfg.long_stop_mode != "ATR Based":
                 long_adr_ok = long_stop_width <= (adr_pct * cfg.max_stop_vs_adr)
 
             if long_entry_proxy and long_close_ok and long_adr_ok:
@@ -607,10 +802,16 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 # Reset
                 long_setup_active = False
                 last_long_bar = i
+                long_avwap_num = 0.0
+                long_avwap_den = 0.0
+                long_run_avwap = 0.0
 
         # TIMEOUT
         if long_setup_active and (i - long_setup_bar > cfg.long_setup_timeout):
             long_setup_active = False
+            long_avwap_num = 0.0
+            long_avwap_den = 0.0
+            long_run_avwap = 0.0
 
     # Close any remaining open trades at last bar
     if open_trades:
@@ -637,36 +838,53 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
 # ═══════════════════════════════════════════════════════════════════
 
 def print_ticker_summary(ticker: str, trades: list):
-    """Print summary for a single ticker."""
+    """Print summary for a single ticker (weight-aware for split exits)."""
     if not trades:
         return
 
-    shorts = [t for t in trades if t.direction == "SHORT"]
-    longs = [t for t in trades if t.direction == "LONG"]
+    shorts = [t for t in trades if t.direction == "SHORT" and not t.is_runner]
+    longs = [t for t in trades if t.direction == "LONG" and not t.is_runner]
     closed = [t for t in trades if t.exit_reason not in ("OPEN_AT_END", "")]
 
     wins = [t for t in closed if t.pnl_pct > 0]
     losses = [t for t in closed if t.pnl_pct <= 0]
-    win_rate = len(wins) / len(closed) * 100 if closed else 0
+    total_weight = sum(t.weight for t in closed)
+    win_weight = sum(t.weight for t in wins)
+    win_rate = win_weight / total_weight * 100 if total_weight > 0 else 0
 
-    total_pnl = sum(t.pnl_pct for t in closed)
-    avg_pnl = total_pnl / len(closed) if closed else 0
-    avg_win = sum(t.pnl_pct for t in wins) / len(wins) if wins else 0
-    avg_loss = sum(t.pnl_pct for t in losses) / len(losses) if losses else 0
+    total_pnl = sum(t.pnl_pct * t.weight for t in closed)
+    avg_pnl = total_pnl / total_weight if total_weight > 0 else 0
+    win_wt = sum(t.weight for t in wins)
+    loss_wt = sum(t.weight for t in losses)
+    avg_win = sum(t.pnl_pct * t.weight for t in wins) / win_wt if win_wt > 0 else 0
+    avg_loss = sum(t.pnl_pct * t.weight for t in losses) / loss_wt if loss_wt > 0 else 0
     avg_bars = sum(t.bars_held for t in closed) / len(closed) if closed else 0
 
-    print(f"  {ticker:<8} | Total: {len(trades):>3} | Short: {len(shorts):>3} | Long: {len(longs):>3} | "
-          f"Closed: {len(closed):>3} | Win%: {win_rate:>6.1f}% | "
+    # Count original setups (non-runners) for Short/Long display
+    print(f"  {ticker:<8} | Total: {len(shorts)+len(longs):>3} | Short: {len(shorts):>3} | Long: {len(longs):>3} | "
+          f"Legs: {len(closed):>3} | Win%: {win_rate:>6.1f}% | "
           f"Avg PnL: {avg_pnl:>+7.2f}% | Avg Win: {avg_win:>+7.2f}% | Avg Loss: {avg_loss:>+7.2f}% | "
           f"Avg Bars: {avg_bars:>5.1f}")
 
 
+def _weighted_avg(trades, attr='pnl_pct'):
+    """Weighted average of a trade attribute by position weight."""
+    total_wt = sum(t.weight for t in trades)
+    if total_wt <= 0:
+        return 0.0
+    return sum(getattr(t, attr) * t.weight for t in trades) / total_wt
+
+
 def print_grand_summary(all_trades: list):
-    """Print comprehensive cross-ticker summary."""
+    """Print comprehensive cross-ticker summary (weight-aware for split exits)."""
     closed = [t for t in all_trades if t.exit_reason not in ("OPEN_AT_END", "")]
     if not closed:
         print("\n  No closed trades across all tickers.")
         return
+
+    # Original setups (non-runners) for setup counts
+    setups = [t for t in all_trades if not t.is_runner]
+    n_setups = len(setups)
 
     shorts = [t for t in closed if t.direction == "SHORT"]
     longs = [t for t in closed if t.direction == "LONG"]
@@ -674,53 +892,65 @@ def print_grand_summary(all_trades: list):
     wins = [t for t in closed if t.pnl_pct > 0]
     losses = [t for t in closed if t.pnl_pct <= 0]
 
-    total_pnl = sum(t.pnl_pct for t in closed)
-    avg_pnl = total_pnl / len(closed)
-    avg_win = sum(t.pnl_pct for t in wins) / len(wins) if wins else 0
-    avg_loss = sum(t.pnl_pct for t in losses) / len(losses) if losses else 0
-    win_rate = len(wins) / len(closed) * 100
+    # Weight-aware metrics
+    total_weight = sum(t.weight for t in closed)
+    win_weight = sum(t.weight for t in wins)
+    loss_weight = sum(t.weight for t in losses)
 
-    # By direction
+    total_pnl = sum(t.pnl_pct * t.weight for t in closed)
+    avg_pnl = total_pnl / total_weight if total_weight > 0 else 0
+    avg_win = _weighted_avg(wins)
+    avg_loss = _weighted_avg(losses)
+    win_rate = win_weight / total_weight * 100 if total_weight > 0 else 0
+
+    # By direction (weighted)
     short_wins = [t for t in shorts if t.pnl_pct > 0]
     short_losses = [t for t in shorts if t.pnl_pct <= 0]
     long_wins = [t for t in longs if t.pnl_pct > 0]
     long_losses = [t for t in longs if t.pnl_pct <= 0]
 
-    short_wr = len(short_wins) / len(shorts) * 100 if shorts else 0
-    long_wr = len(long_wins) / len(longs) * 100 if longs else 0
-    short_avg = sum(t.pnl_pct for t in shorts) / len(shorts) if shorts else 0
-    long_avg = sum(t.pnl_pct for t in longs) / len(longs) if longs else 0
+    short_wt = sum(t.weight for t in shorts)
+    long_wt = sum(t.weight for t in longs)
+    short_win_wt = sum(t.weight for t in short_wins)
+    long_win_wt = sum(t.weight for t in long_wins)
+    short_wr = short_win_wt / short_wt * 100 if short_wt > 0 else 0
+    long_wr = long_win_wt / long_wt * 100 if long_wt > 0 else 0
+    short_avg = _weighted_avg(shorts)
+    long_avg = _weighted_avg(longs)
 
     # By exit reason
     stops = [t for t in closed if t.exit_reason == "STOP"]
     t10 = [t for t in closed if t.exit_reason == "TARGET_10MA"]
+    t10p = [t for t in closed if t.exit_reason == "TARGET_10MA_PARTIAL"]
     t20 = [t for t in closed if t.exit_reason == "TARGET_20MA"]
+    sbe = [t for t in closed if t.exit_reason == "STOP_BREAKEVEN"]
     timeouts = [t for t in closed if t.exit_reason == "TIMEOUT"]
 
-    # Profit factor
-    gross_profit = sum(t.pnl_pct for t in wins) if wins else 0
-    gross_loss = abs(sum(t.pnl_pct for t in losses)) if losses else 0
+    # Profit factor (weighted)
+    gross_profit = sum(t.pnl_pct * t.weight for t in wins) if wins else 0
+    gross_loss = abs(sum(t.pnl_pct * t.weight for t in losses)) if losses else 0
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
-    # Max drawdown (sequential PnL)
+    # Max drawdown (sequential weighted PnL)
     cumulative = 0.0
     peak_cum = 0.0
     max_dd = 0.0
-    for t in sorted(closed, key=lambda x: x.entry_bar):
-        cumulative += t.pnl_pct
+    for t in sorted(closed, key=lambda x: (x.exit_bar, -x.is_runner)):
+        cumulative += t.pnl_pct * t.weight
         if cumulative > peak_cum:
             peak_cum = cumulative
         dd = peak_cum - cumulative
         if dd > max_dd:
             max_dd = dd
 
-    # Average R-multiple
-    r_values = [t.r_multiple for t in closed if t.risk_pct > 0]
-    avg_r = sum(r_values) / len(r_values) if r_values else 0
+    # Average R-multiple (weighted)
+    r_trades = [t for t in closed if t.risk_pct > 0]
+    r_wt = sum(t.weight for t in r_trades)
+    avg_r = sum(t.r_multiple * t.weight for t in r_trades) / r_wt if r_wt > 0 else 0
 
-    # Best and worst trades
-    best = max(closed, key=lambda t: t.pnl_pct)
-    worst = min(closed, key=lambda t: t.pnl_pct)
+    # Best and worst trades (by weighted PnL)
+    best = max(closed, key=lambda t: t.pnl_pct * t.weight)
+    worst = min(closed, key=lambda t: t.pnl_pct * t.weight)
 
     # Avg holding period
     avg_bars = sum(t.bars_held for t in closed) / len(closed)
@@ -732,13 +962,13 @@ def print_grand_summary(all_trades: list):
     print("                    GRAND BACKTEST SUMMARY — Parabolic Mean Reversion V1")
     print("=" * 100)
 
-    print(f"\n  Total Closed Trades:     {len(closed)}")
+    print(f"\n  Original Setups:         {n_setups}")
+    print(f"  Total Trade Legs:        {len(closed)}  (includes runner legs from split exits)")
     print(f"  Tickers With Setups:     {tickers_with_trades}")
-    print(f"  Total Setups Generated:  {len(all_trades)}")
     print(f"  Open at End (excluded):  {len(all_trades) - len(closed)}")
 
-    print(f"\n  ── Overall Performance ──")
-    print(f"  Win Rate:                {win_rate:.1f}% ({len(wins)}W / {len(losses)}L)")
+    print(f"\n  ── Overall Performance (weighted) ──")
+    print(f"  Win Rate:                {win_rate:.1f}% ({win_weight:.1f}W / {loss_weight:.1f}L weighted)")
     print(f"  Avg PnL per Trade:       {avg_pnl:+.2f}%")
     print(f"  Avg Winner:              {avg_win:+.2f}%")
     print(f"  Avg Loser:               {avg_loss:+.2f}%")
@@ -748,77 +978,222 @@ def print_grand_summary(all_trades: list):
     print(f"  Max Drawdown (seq):      {max_dd:.2f}%")
     print(f"  Avg Holding Period:      {avg_bars:.1f} bars")
 
-    print(f"\n  ── By Direction ──")
-    print(f"  SHORT:  {len(shorts):>4} trades | Win Rate: {short_wr:>5.1f}% | Avg PnL: {short_avg:>+7.2f}%")
+    print(f"\n  ── By Direction (weighted) ──")
+    short_setups = len([t for t in shorts if not t.is_runner])
+    long_setups = len([t for t in longs if not t.is_runner])
+    print(f"  SHORT:  {short_setups:>4} setups ({len(shorts)} legs) | Win Rate: {short_wr:>5.1f}% | Avg PnL: {short_avg:>+7.2f}%")
     if shorts:
-        short_avg_win = sum(t.pnl_pct for t in short_wins) / len(short_wins) if short_wins else 0
-        short_avg_loss = sum(t.pnl_pct for t in short_losses) / len(short_losses) if short_losses else 0
-        print(f"           Avg Win: {short_avg_win:>+7.2f}% | Avg Loss: {short_avg_loss:>+7.2f}%")
-    print(f"  LONG:   {len(longs):>4} trades | Win Rate: {long_wr:>5.1f}% | Avg PnL: {long_avg:>+7.2f}%")
+        print(f"           Avg Win: {_weighted_avg(short_wins):>+7.2f}% | Avg Loss: {_weighted_avg(short_losses):>+7.2f}%")
+    print(f"  LONG:   {long_setups:>4} setups ({len(longs)} legs) | Win Rate: {long_wr:>5.1f}% | Avg PnL: {long_avg:>+7.2f}%")
     if longs:
-        long_avg_win = sum(t.pnl_pct for t in long_wins) / len(long_wins) if long_wins else 0
-        long_avg_loss = sum(t.pnl_pct for t in long_losses) / len(long_losses) if long_losses else 0
-        print(f"           Avg Win: {long_avg_win:>+7.2f}% | Avg Loss: {long_avg_loss:>+7.2f}%")
+        print(f"           Avg Win: {_weighted_avg(long_wins):>+7.2f}% | Avg Loss: {_weighted_avg(long_losses):>+7.2f}%")
 
     print(f"\n  ── By Exit Reason ──")
-    print(f"  STOP:        {len(stops):>4}  ({len(stops)/len(closed)*100:>5.1f}%)  Avg PnL: {sum(t.pnl_pct for t in stops)/len(stops) if stops else 0:>+7.2f}%")
-    print(f"  TARGET_10MA: {len(t10):>4}  ({len(t10)/len(closed)*100:>5.1f}%)  Avg PnL: {sum(t.pnl_pct for t in t10)/len(t10) if t10 else 0:>+7.2f}%")
-    print(f"  TARGET_20MA: {len(t20):>4}  ({len(t20)/len(closed)*100:>5.1f}%)  Avg PnL: {sum(t.pnl_pct for t in t20)/len(t20) if t20 else 0:>+7.2f}%")
-    print(f"  TIMEOUT:     {len(timeouts):>4}  ({len(timeouts)/len(closed)*100:>5.1f}%)  Avg PnL: {sum(t.pnl_pct for t in timeouts)/len(timeouts) if timeouts else 0:>+7.2f}%")
+    n = len(closed)
+    def _reason_line(label, bucket):
+        pct = len(bucket) / n * 100 if n else 0
+        avg = _weighted_avg(bucket) if bucket else 0
+        wt = sum(t.weight for t in bucket)
+        print(f"  {label:<19} {len(bucket):>4}  ({pct:>5.1f}%)  Wt: {wt:>5.1f}  Avg PnL: {avg:>+7.2f}%")
+    _reason_line("STOP:", stops)
+    _reason_line("TARGET_10MA:", t10)
+    _reason_line("TARGET_10MA_PARTIAL:", t10p)
+    _reason_line("TARGET_20MA:", t20)
+    _reason_line("STOP_BREAKEVEN:", sbe)
+    _reason_line("TIMEOUT:", timeouts)
 
     print(f"\n  ── Extremes ──")
-    print(f"  Best Trade:   {best.ticker} {best.direction} {best.entry_date} → {best.exit_date}  PnL: {best.pnl_pct:+.2f}%  ({best.exit_reason})")
-    print(f"  Worst Trade:  {worst.ticker} {worst.direction} {worst.entry_date} → {worst.exit_date}  PnL: {worst.pnl_pct:+.2f}%  ({worst.exit_reason})")
+    print(f"  Best Trade:   {best.ticker} {best.direction} {best.entry_date} → {best.exit_date}  PnL: {best.pnl_pct:+.2f}% x{best.weight:.0%}  ({best.exit_reason})")
+    print(f"  Worst Trade:  {worst.ticker} {worst.direction} {worst.entry_date} → {worst.exit_date}  PnL: {worst.pnl_pct:+.2f}% x{worst.weight:.0%}  ({worst.exit_reason})")
 
     # Top 10 trades
-    sorted_trades = sorted(closed, key=lambda t: t.pnl_pct, reverse=True)
+    sorted_trades = sorted(closed, key=lambda t: t.pnl_pct * t.weight, reverse=True)
     print(f"\n  ── Top 10 Trades ──")
-    print(f"  {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Exit':>10} {'PnL%':>8} {'R':>6} {'Exit Reason':<14} {'Bars':>5}")
-    print(f"  {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*8} {'-'*6} {'-'*14} {'-'*5}")
+    print(f"  {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Exit':>10} {'PnL%':>8} {'Wt':>4} {'R':>6} {'Exit Reason':<20} {'Bars':>5}")
+    print(f"  {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*8} {'-'*4} {'-'*6} {'-'*20} {'-'*5}")
     for t in sorted_trades[:10]:
         print(f"  {t.ticker:<8} {t.direction:<6} {t.entry_date:<12} {t.exit_date:<12} "
-              f"{t.entry_price:>10.2f} {t.exit_price:>10.2f} {t.pnl_pct:>+7.2f}% {t.r_multiple:>+5.2f}R "
-              f"{t.exit_reason:<14} {t.bars_held:>5}")
+              f"{t.entry_price:>10.2f} {t.exit_price:>10.2f} {t.pnl_pct:>+7.2f}% {t.weight:>3.0%} {t.r_multiple:>+5.2f}R "
+              f"{t.exit_reason:<20} {t.bars_held:>5}")
 
     # Bottom 10 trades
     print(f"\n  ── Bottom 10 Trades ──")
-    print(f"  {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Exit':>10} {'PnL%':>8} {'R':>6} {'Exit Reason':<14} {'Bars':>5}")
-    print(f"  {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*8} {'-'*6} {'-'*14} {'-'*5}")
+    print(f"  {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Exit':>10} {'PnL%':>8} {'Wt':>4} {'R':>6} {'Exit Reason':<20} {'Bars':>5}")
+    print(f"  {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*8} {'-'*4} {'-'*6} {'-'*20} {'-'*5}")
     for t in sorted_trades[-10:]:
         print(f"  {t.ticker:<8} {t.direction:<6} {t.entry_date:<12} {t.exit_date:<12} "
-              f"{t.entry_price:>10.2f} {t.exit_price:>10.2f} {t.pnl_pct:>+7.2f}% {t.r_multiple:>+5.2f}R "
-              f"{t.exit_reason:<14} {t.bars_held:>5}")
+              f"{t.entry_price:>10.2f} {t.exit_price:>10.2f} {t.pnl_pct:>+7.2f}% {t.weight:>3.0%} {t.r_multiple:>+5.2f}R "
+              f"{t.exit_reason:<20} {t.bars_held:>5}")
 
-    # Per-ticker breakdown
-    print(f"\n  ── Per-Ticker Breakdown ──")
-    print(f"  {'Ticker':<8} {'Trades':>7} {'Short':>6} {'Long':>6} {'Win%':>7} {'Avg PnL':>9} {'Total PnL':>10} {'Best':>8} {'Worst':>8}")
-    print(f"  {'-'*8} {'-'*7} {'-'*6} {'-'*6} {'-'*7} {'-'*9} {'-'*10} {'-'*8} {'-'*8}")
+    # Per-ticker breakdown (weighted)
+    print(f"\n  ── Per-Ticker Breakdown (weighted PnL) ──")
+    print(f"  {'Ticker':<8} {'Setups':>7} {'Legs':>6} {'Short':>6} {'Long':>6} {'Win%':>7} {'Avg PnL':>9} {'Total PnL':>10} {'Best':>8} {'Worst':>8}")
+    print(f"  {'-'*8} {'-'*7} {'-'*6} {'-'*6} {'-'*6} {'-'*7} {'-'*9} {'-'*10} {'-'*8} {'-'*8}")
 
     tickers = sorted(set(t.ticker for t in closed))
     for tkr in tickers:
         tkr_trades = [t for t in closed if t.ticker == tkr]
-        tkr_shorts = [t for t in tkr_trades if t.direction == "SHORT"]
-        tkr_longs = [t for t in tkr_trades if t.direction == "LONG"]
+        tkr_setups = [t for t in tkr_trades if not t.is_runner]
+        tkr_shorts = [t for t in tkr_setups if t.direction == "SHORT"]
+        tkr_longs = [t for t in tkr_setups if t.direction == "LONG"]
         tkr_wins = [t for t in tkr_trades if t.pnl_pct > 0]
-        tkr_wr = len(tkr_wins) / len(tkr_trades) * 100 if tkr_trades else 0
-        tkr_avg = sum(t.pnl_pct for t in tkr_trades) / len(tkr_trades) if tkr_trades else 0
-        tkr_total = sum(t.pnl_pct for t in tkr_trades)
-        tkr_best = max(t.pnl_pct for t in tkr_trades) if tkr_trades else 0
-        tkr_worst = min(t.pnl_pct for t in tkr_trades) if tkr_trades else 0
-        print(f"  {tkr:<8} {len(tkr_trades):>7} {len(tkr_shorts):>6} {len(tkr_longs):>6} "
+        tkr_wt = sum(t.weight for t in tkr_trades)
+        tkr_win_wt = sum(t.weight for t in tkr_wins)
+        tkr_wr = tkr_win_wt / tkr_wt * 100 if tkr_wt > 0 else 0
+        tkr_avg = _weighted_avg(tkr_trades)
+        tkr_total = sum(t.pnl_pct * t.weight for t in tkr_trades)
+        tkr_best = max(t.pnl_pct * t.weight for t in tkr_trades) if tkr_trades else 0
+        tkr_worst = min(t.pnl_pct * t.weight for t in tkr_trades) if tkr_trades else 0
+        print(f"  {tkr:<8} {len(tkr_setups):>7} {len(tkr_trades):>6} {len(tkr_shorts):>6} {len(tkr_longs):>6} "
               f"{tkr_wr:>6.1f}% {tkr_avg:>+8.2f}% {tkr_total:>+9.2f}% {tkr_best:>+7.2f}% {tkr_worst:>+7.2f}%")
 
     # All closed trades log
-    print(f"\n  ── Complete Trade Log ({len(closed)} closed trades) ──")
-    print(f"  {'#':>4} {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Stop':>10} {'Exit':>10} {'PnL%':>8} {'R':>6} {'Reason':<14} {'Bars':>5} {'Ext%':>7} {'Gain%':>7}")
-    print(f"  {'-'*4} {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*8} {'-'*6} {'-'*14} {'-'*5} {'-'*7} {'-'*7}")
-    for idx, t in enumerate(sorted(closed, key=lambda x: (x.ticker, x.entry_bar)), 1):
+    print(f"\n  ── Complete Trade Log ({len(closed)} legs from {n_setups} setups) ──")
+    print(f"  {'#':>4} {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Stop':>10} {'Exit':>10} {'PnL%':>8} {'Wt':>4} {'R':>6} {'Reason':<20} {'Bars':>5} {'Ext%':>7} {'Gain%':>7}")
+    print(f"  {'-'*4} {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*8} {'-'*4} {'-'*6} {'-'*20} {'-'*5} {'-'*7} {'-'*7}")
+    for idx, t in enumerate(sorted(closed, key=lambda x: (x.ticker, x.entry_bar, x.is_runner)), 1):
         print(f"  {idx:>4} {t.ticker:<8} {t.direction:<6} {t.entry_date:<12} {t.exit_date:<12} "
               f"{t.entry_price:>10.2f} {t.stop_price:>10.2f} {t.exit_price:>10.2f} "
-              f"{t.pnl_pct:>+7.2f}% {t.r_multiple:>+5.2f}R {t.exit_reason:<14} {t.bars_held:>5} "
+              f"{t.pnl_pct:>+7.2f}% {t.weight:>3.0%} {t.r_multiple:>+5.2f}R {t.exit_reason:<20} {t.bars_held:>5} "
               f"{t.extension_pct:>+6.1f}% {t.rolling_gain_pct:>+6.1f}%")
 
     print("\n" + "=" * 100)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PARAMETER SWEEP
+# ═══════════════════════════════════════════════════════════════════
+
+def run_sweep(csv_files: list):
+    """Grid search across ATR mult, crash velocity, selling climax RVOL."""
+    from dataclasses import replace
+    import itertools
+
+    base_cfg = Config()
+
+    # Parameter grids
+    atr_mults = [1.0, 1.5, 2.0, 2.5, 3.0]
+    crash_velocities = [0.0, 3.0, 5.0, 7.0, 10.0]  # 0 = disabled (original behavior)
+    selling_climax_rvols = [0.0, 1.5, 2.0, 2.5, 3.0]  # 0 = disabled
+    directions = ["BOTH", "SHORT", "LONG"]
+
+    # Preload all bar data
+    ticker_bars = []
+    for csv_file in csv_files:
+        ticker = extract_ticker(csv_file)
+        bars = load_csv(csv_file)
+        ticker_bars.append((ticker, bars))
+
+    results = []
+    total_combos = len(atr_mults) * len(crash_velocities) * len(selling_climax_rvols) * len(directions)
+    combo_num = 0
+
+    print(f"\n  Running parameter sweep: {total_combos} combinations...")
+    print(f"  ATR mults: {atr_mults}")
+    print(f"  Crash velocities: {crash_velocities}")
+    print(f"  Selling climax RVOLs: {selling_climax_rvols}")
+    print(f"  Directions: {directions}\n")
+
+    header = (f"  {'#':>4} {'Dir':<6} {'ATR_M':>5} {'Vel':>5} {'SC_RV':>5} "
+              f"{'Setups':>6} {'S':>4} {'L':>4} {'WR%':>6} {'AvgPnL':>8} "
+              f"{'PF':>6} {'CumPnL':>9} {'AvgWin':>8} {'AvgLoss':>8} {'MaxDD':>7}")
+    print(header)
+    print(f"  {'-' * len(header)}")
+
+    for atr_m, vel, sc_rv, direction in itertools.product(atr_mults, crash_velocities, selling_climax_rvols, directions):
+        combo_num += 1
+        cfg = replace(base_cfg,
+                      atr_mult=atr_m,
+                      crash_velocity_min=vel if vel > 0 else 0.0,
+                      require_selling_climax=sc_rv > 0,
+                      selling_climax_rvol=sc_rv if sc_rv > 0 else 2.0,
+                      enable_short=direction in ("BOTH", "SHORT"),
+                      enable_long=direction in ("BOTH", "LONG"),
+                      )
+
+        all_trades = []
+        for ticker, bars in ticker_bars:
+            trades = run_backtest(ticker, bars, cfg)
+            all_trades.extend(trades)
+
+        closed = [t for t in all_trades if t.exit_reason not in ("OPEN_AT_END", "")]
+        if not closed:
+            continue
+
+        setups = [t for t in all_trades if not t.is_runner]
+        shorts_n = len([t for t in setups if t.direction == "SHORT"])
+        longs_n = len([t for t in setups if t.direction == "LONG"])
+
+        wins = [t for t in closed if t.pnl_pct > 0]
+        losses = [t for t in closed if t.pnl_pct <= 0]
+        total_weight = sum(t.weight for t in closed)
+        win_weight = sum(t.weight for t in wins)
+        wr = win_weight / total_weight * 100 if total_weight > 0 else 0
+        total_pnl = sum(t.pnl_pct * t.weight for t in closed)
+        avg_pnl = total_pnl / total_weight if total_weight > 0 else 0
+        gross_profit = sum(t.pnl_pct * t.weight for t in wins)
+        gross_loss = abs(sum(t.pnl_pct * t.weight for t in losses))
+        pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        avg_win = _weighted_avg(wins) if wins else 0
+        avg_loss = _weighted_avg(losses) if losses else 0
+
+        # Max drawdown
+        cumulative = 0.0
+        peak_cum = 0.0
+        max_dd = 0.0
+        for t in sorted(closed, key=lambda x: (x.exit_bar, -x.is_runner)):
+            cumulative += t.pnl_pct * t.weight
+            if cumulative > peak_cum:
+                peak_cum = cumulative
+            dd = peak_cum - cumulative
+            if dd > max_dd:
+                max_dd = dd
+
+        vel_str = f"{vel:.0f}" if vel > 0 else "off"
+        sc_str = f"{sc_rv:.1f}" if sc_rv > 0 else "off"
+
+        print(f"  {combo_num:>4} {direction:<6} {atr_m:>5.1f} {vel_str:>5} {sc_str:>5} "
+              f"{len(setups):>6} {shorts_n:>4} {longs_n:>4} {wr:>5.1f}% {avg_pnl:>+7.2f}% "
+              f"{pf:>5.2f} {total_pnl:>+8.1f}% {avg_win:>+7.2f}% {avg_loss:>+7.2f}% {max_dd:>6.1f}%")
+
+        results.append({
+            'direction': direction, 'atr_mult': atr_m,
+            'crash_velocity': vel, 'selling_climax_rvol': sc_rv,
+            'setups': len(setups), 'shorts': shorts_n, 'longs': longs_n,
+            'wr': wr, 'avg_pnl': avg_pnl, 'pf': pf,
+            'cum_pnl': total_pnl, 'avg_win': avg_win, 'avg_loss': avg_loss,
+            'max_dd': max_dd,
+        })
+
+    # Print top 20 by profit factor (min 10 setups)
+    viable = [r for r in results if r['setups'] >= 10]
+    top_pf = sorted(viable, key=lambda r: r['pf'], reverse=True)[:20]
+
+    print(f"\n  ═══ TOP 20 BY PROFIT FACTOR (min 10 setups) ═══")
+    print(f"  {'#':>3} {'Dir':<6} {'ATR_M':>5} {'Vel':>5} {'SC_RV':>5} "
+          f"{'Setups':>6} {'S':>4} {'L':>4} {'WR%':>6} {'AvgPnL':>8} "
+          f"{'PF':>6} {'CumPnL':>9} {'MaxDD':>7}")
+    for idx, r in enumerate(top_pf, 1):
+        vel_str = f"{r['crash_velocity']:.0f}" if r['crash_velocity'] > 0 else "off"
+        sc_str = f"{r['selling_climax_rvol']:.1f}" if r['selling_climax_rvol'] > 0 else "off"
+        print(f"  {idx:>3} {r['direction']:<6} {r['atr_mult']:>5.1f} {vel_str:>5} {sc_str:>5} "
+              f"{r['setups']:>6} {r['shorts']:>4} {r['longs']:>4} {r['wr']:>5.1f}% {r['avg_pnl']:>+7.2f}% "
+              f"{r['pf']:>5.2f} {r['cum_pnl']:>+8.1f}% {r['max_dd']:>6.1f}%")
+
+    # Top 20 by avg PnL
+    top_avg = sorted(viable, key=lambda r: r['avg_pnl'], reverse=True)[:20]
+    print(f"\n  ═══ TOP 20 BY AVG PNL (min 10 setups) ═══")
+    print(f"  {'#':>3} {'Dir':<6} {'ATR_M':>5} {'Vel':>5} {'SC_RV':>5} "
+          f"{'Setups':>6} {'S':>4} {'L':>4} {'WR%':>6} {'AvgPnL':>8} "
+          f"{'PF':>6} {'CumPnL':>9} {'MaxDD':>7}")
+    for idx, r in enumerate(top_avg, 1):
+        vel_str = f"{r['crash_velocity']:.0f}" if r['crash_velocity'] > 0 else "off"
+        sc_str = f"{r['selling_climax_rvol']:.1f}" if r['selling_climax_rvol'] > 0 else "off"
+        print(f"  {idx:>3} {r['direction']:<6} {r['atr_mult']:>5.1f} {vel_str:>5} {sc_str:>5} "
+              f"{r['setups']:>6} {r['shorts']:>4} {r['longs']:>4} {r['wr']:>5.1f}% {r['avg_pnl']:>+7.2f}% "
+              f"{r['pf']:>5.2f} {r['cum_pnl']:>+8.1f}% {r['max_dd']:>6.1f}%")
+
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -830,6 +1205,11 @@ def main():
     parser.add_argument(
         "--data-dir",
         help="Directory containing OHLC CSV files (defaults to auto-discovery)",
+    )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Run parameter sweep instead of single backtest",
     )
     args = parser.parse_args()
 
@@ -854,6 +1234,10 @@ def main():
         print(f"ERROR: No CSV files found in {data_dir}")
         sys.exit(1)
 
+    if args.sweep:
+        run_sweep(csv_files)
+        return
+
     cfg = Config()
 
     print("=" * 100)
@@ -871,6 +1255,8 @@ def main():
     print(f"    Min Ext Above MA:    {cfg.min_ext_above_ma}%")
     print(f"    Min Crash %:         {cfg.min_crash_pct}%")
     print(f"    Crash Window:        {cfg.crash_window} bars")
+    print(f"    Crash Velocity Min:  {cfg.crash_velocity_min}%/bar")
+    print(f"    Selling Climax Gate: {cfg.require_selling_climax} (RVOL >= {cfg.selling_climax_rvol}x)")
     print(f"    Require Prior Run:   {cfg.require_prior_run} (min {cfg.prior_run_min_pct}%)")
     print(f"    Short Trigger:       {cfg.short_trigger}")
     print(f"    Long Trigger:        {cfg.long_trigger}")
@@ -880,13 +1266,15 @@ def main():
     print(f"    Setup Timeout:       {cfg.short_setup_timeout} / {cfg.long_setup_timeout} bars")
     print(f"    Cooldown:            {cfg.cooldown_bars} bars")
     print(f"    Max Trade Duration:  {cfg.max_trade_bars} bars")
-    print(f"    Volume Gates:        BYPASSED (no volume in data)")
+    print(f"    Split Exit:          {cfg.split_exit} ({cfg.split_pct}% at 10MA, {100-cfg.split_pct}% runner to 20MA)")
+    print(f"    Climax Volume:       {cfg.use_climax_vol} (RVOL >= {cfg.rvol_threshold}x, window {cfg.climax_window_bars} bars)")
+    print(f"    Dollar Vol Filter:   >= ${cfg.min_avg_dollar_vol}M avg")
     print(f"    ADR Filter:          {cfg.use_adr_filter} (max {cfg.max_stop_vs_adr}x ADR)")
     print(f"    Min Price:           ${cfg.min_price}")
     print(f"    Min ADR:             {cfg.min_adr_pct}%")
 
     print(f"\n  ── Per-Ticker Results ──")
-    print(f"  {'Ticker':<8} | {'Total':>6} | {'Short':>6} | {'Long':>6} | {'Closed':>7} | {'Win%':>7} | "
+    print(f"  {'Ticker':<8} | {'Total':>6} | {'Short':>6} | {'Long':>6} | {'Legs':>7} | {'Win%':>7} | "
           f"{'Avg PnL':>9} | {'Avg Win':>9} | {'Avg Loss':>9} | {'Avg Bars':>9}")
     print(f"  {'-' * 100}")
 
