@@ -79,11 +79,15 @@ class Config:
     use_trend_filter: bool = False
     trend_ma_len: int = 50
 
+    # Split Exit — partial at 10MA, runner to 20MA with breakeven stop
+    split_exit: bool = True
+    split_pct: float = 50.0  # % of position to close at 10MA; rest runs to 20MA
+
     # Quality Gates
     min_close_strength: float = 0.0
     use_adr_filter: bool = True
     adr_len: int = 20
-    max_stop_vs_adr: float = 2.5     # Relaxed for parabolic peaks (plan default: 1.0)
+    max_stop_vs_adr: float = 1.5     # Tightened from 2.5x for loss containment (plan default: 1.0)
 
     # Risk Management
     short_stop_mode: str = "Run Peak"
@@ -132,10 +136,12 @@ class Trade:
     exit_bar: int = -1
     exit_date: str = ""
     exit_price: float = 0.0
-    exit_reason: str = ""  # "STOP", "TARGET_10MA", "TARGET_20MA", "TIMEOUT"
+    exit_reason: str = ""  # "STOP", "TARGET_10MA", "TARGET_10MA_PARTIAL", "TARGET_20MA", "STOP_BREAKEVEN", "TIMEOUT"
     pnl_pct: float = 0.0
     r_multiple: float = 0.0
     bars_held: int = 0
+    weight: float = 1.0  # Position weight (1.0 = full, 0.5 = half for split exits)
+    is_runner: bool = False  # True for runner leg of split exit
     # Context metrics at entry
     extension_pct: float = 0.0
     rolling_gain_pct: float = 0.0
@@ -273,21 +279,52 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = t.stop_price
-                    t.exit_reason = "STOP"
+                    t.exit_reason = "STOP_BREAKEVEN" if t.is_runner else "STOP"
                     t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
                     t.bars_held = bars_held
                     if t.risk_pct > 0:
                         t.r_multiple = t.pnl_pct / t.risk_pct
-                # Check target (price reached 10 MA or 20 MA — below entry for shorts)
-                elif bar.low <= t.target_fast and t.target_fast < t.entry_price:
-                    t.exit_bar = i
-                    t.exit_date = bar.date
-                    t.exit_price = t.target_fast
-                    t.exit_reason = "TARGET_10MA"
-                    t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
-                    t.bars_held = bars_held
-                    if t.risk_pct > 0:
-                        t.r_multiple = t.pnl_pct / t.risk_pct
+                # Check 10MA target (skip for runners — they target 20MA only)
+                elif not t.is_runner and bar.low <= t.target_fast and t.target_fast < t.entry_price:
+                    if cfg.split_exit:
+                        # Partial exit: close split_pct at 10MA
+                        t.exit_bar = i
+                        t.exit_date = bar.date
+                        t.exit_price = t.target_fast
+                        t.exit_reason = "TARGET_10MA_PARTIAL"
+                        t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
+                        t.bars_held = bars_held
+                        t.weight = cfg.split_pct / 100.0
+                        if t.risk_pct > 0:
+                            t.r_multiple = t.pnl_pct / t.risk_pct
+                        # Create runner for remaining portion
+                        runner = Trade(
+                            ticker=t.ticker, direction="SHORT",
+                            entry_bar=t.entry_bar, entry_date=t.entry_date,
+                            entry_price=t.entry_price,
+                            stop_price=t.entry_price,  # breakeven stop
+                            target_fast=t.target_fast,
+                            target_slow=t.target_slow,
+                            extension_pct=t.extension_pct,
+                            rolling_gain_pct=t.rolling_gain_pct,
+                            green_streak=t.green_streak,
+                            risk_pct=t.risk_pct,
+                            weight=1.0 - cfg.split_pct / 100.0,
+                            is_runner=True,
+                        )
+                        trades.append(runner)
+                        new_open_trades.append(runner)
+                    else:
+                        # Full exit at 10MA (original behavior)
+                        t.exit_bar = i
+                        t.exit_date = bar.date
+                        t.exit_price = t.target_fast
+                        t.exit_reason = "TARGET_10MA"
+                        t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
+                        t.bars_held = bars_held
+                        if t.risk_pct > 0:
+                            t.r_multiple = t.pnl_pct / t.risk_pct
+                # Check 20MA target
                 elif bar.low <= t.target_slow and t.target_slow < t.entry_price:
                     t.exit_bar = i
                     t.exit_date = bar.date
@@ -316,21 +353,50 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = t.stop_price
-                    t.exit_reason = "STOP"
+                    t.exit_reason = "STOP_BREAKEVEN" if t.is_runner else "STOP"
                     t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
                     t.bars_held = bars_held
                     if t.risk_pct > 0:
                         t.r_multiple = t.pnl_pct / t.risk_pct
-                # Check target (price reached 10 MA or 20 MA — above entry for longs)
-                elif bar.high >= t.target_fast and t.target_fast > t.entry_price:
-                    t.exit_bar = i
-                    t.exit_date = bar.date
-                    t.exit_price = t.target_fast
-                    t.exit_reason = "TARGET_10MA"
-                    t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
-                    t.bars_held = bars_held
-                    if t.risk_pct > 0:
-                        t.r_multiple = t.pnl_pct / t.risk_pct
+                # Check 10MA target (skip for runners — they target 20MA only)
+                elif not t.is_runner and bar.high >= t.target_fast and t.target_fast > t.entry_price:
+                    if cfg.split_exit:
+                        # Partial exit: close split_pct at 10MA
+                        t.exit_bar = i
+                        t.exit_date = bar.date
+                        t.exit_price = t.target_fast
+                        t.exit_reason = "TARGET_10MA_PARTIAL"
+                        t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
+                        t.bars_held = bars_held
+                        t.weight = cfg.split_pct / 100.0
+                        if t.risk_pct > 0:
+                            t.r_multiple = t.pnl_pct / t.risk_pct
+                        # Create runner for remaining portion
+                        runner = Trade(
+                            ticker=t.ticker, direction="LONG",
+                            entry_bar=t.entry_bar, entry_date=t.entry_date,
+                            entry_price=t.entry_price,
+                            stop_price=t.entry_price,  # breakeven stop
+                            target_fast=t.target_fast,
+                            target_slow=t.target_slow,
+                            crash_from_peak=t.crash_from_peak,
+                            risk_pct=t.risk_pct,
+                            weight=1.0 - cfg.split_pct / 100.0,
+                            is_runner=True,
+                        )
+                        trades.append(runner)
+                        new_open_trades.append(runner)
+                    else:
+                        # Full exit at 10MA (original behavior)
+                        t.exit_bar = i
+                        t.exit_date = bar.date
+                        t.exit_price = t.target_fast
+                        t.exit_reason = "TARGET_10MA"
+                        t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
+                        t.bars_held = bars_held
+                        if t.risk_pct > 0:
+                            t.r_multiple = t.pnl_pct / t.risk_pct
+                # Check 20MA target
                 elif bar.high >= t.target_slow and t.target_slow > t.entry_price:
                     t.exit_bar = i
                     t.exit_date = bar.date
@@ -637,36 +703,53 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
 # ═══════════════════════════════════════════════════════════════════
 
 def print_ticker_summary(ticker: str, trades: list):
-    """Print summary for a single ticker."""
+    """Print summary for a single ticker (weight-aware for split exits)."""
     if not trades:
         return
 
-    shorts = [t for t in trades if t.direction == "SHORT"]
-    longs = [t for t in trades if t.direction == "LONG"]
+    shorts = [t for t in trades if t.direction == "SHORT" and not t.is_runner]
+    longs = [t for t in trades if t.direction == "LONG" and not t.is_runner]
     closed = [t for t in trades if t.exit_reason not in ("OPEN_AT_END", "")]
 
     wins = [t for t in closed if t.pnl_pct > 0]
     losses = [t for t in closed if t.pnl_pct <= 0]
-    win_rate = len(wins) / len(closed) * 100 if closed else 0
+    total_weight = sum(t.weight for t in closed)
+    win_weight = sum(t.weight for t in wins)
+    win_rate = win_weight / total_weight * 100 if total_weight > 0 else 0
 
-    total_pnl = sum(t.pnl_pct for t in closed)
-    avg_pnl = total_pnl / len(closed) if closed else 0
-    avg_win = sum(t.pnl_pct for t in wins) / len(wins) if wins else 0
-    avg_loss = sum(t.pnl_pct for t in losses) / len(losses) if losses else 0
+    total_pnl = sum(t.pnl_pct * t.weight for t in closed)
+    avg_pnl = total_pnl / total_weight if total_weight > 0 else 0
+    win_wt = sum(t.weight for t in wins)
+    loss_wt = sum(t.weight for t in losses)
+    avg_win = sum(t.pnl_pct * t.weight for t in wins) / win_wt if win_wt > 0 else 0
+    avg_loss = sum(t.pnl_pct * t.weight for t in losses) / loss_wt if loss_wt > 0 else 0
     avg_bars = sum(t.bars_held for t in closed) / len(closed) if closed else 0
 
-    print(f"  {ticker:<8} | Total: {len(trades):>3} | Short: {len(shorts):>3} | Long: {len(longs):>3} | "
-          f"Closed: {len(closed):>3} | Win%: {win_rate:>6.1f}% | "
+    # Count original setups (non-runners) for Short/Long display
+    print(f"  {ticker:<8} | Total: {len(shorts)+len(longs):>3} | Short: {len(shorts):>3} | Long: {len(longs):>3} | "
+          f"Legs: {len(closed):>3} | Win%: {win_rate:>6.1f}% | "
           f"Avg PnL: {avg_pnl:>+7.2f}% | Avg Win: {avg_win:>+7.2f}% | Avg Loss: {avg_loss:>+7.2f}% | "
           f"Avg Bars: {avg_bars:>5.1f}")
 
 
+def _weighted_avg(trades, attr='pnl_pct'):
+    """Weighted average of a trade attribute by position weight."""
+    total_wt = sum(t.weight for t in trades)
+    if total_wt <= 0:
+        return 0.0
+    return sum(getattr(t, attr) * t.weight for t in trades) / total_wt
+
+
 def print_grand_summary(all_trades: list):
-    """Print comprehensive cross-ticker summary."""
+    """Print comprehensive cross-ticker summary (weight-aware for split exits)."""
     closed = [t for t in all_trades if t.exit_reason not in ("OPEN_AT_END", "")]
     if not closed:
         print("\n  No closed trades across all tickers.")
         return
+
+    # Original setups (non-runners) for setup counts
+    setups = [t for t in all_trades if not t.is_runner]
+    n_setups = len(setups)
 
     shorts = [t for t in closed if t.direction == "SHORT"]
     longs = [t for t in closed if t.direction == "LONG"]
@@ -674,53 +757,65 @@ def print_grand_summary(all_trades: list):
     wins = [t for t in closed if t.pnl_pct > 0]
     losses = [t for t in closed if t.pnl_pct <= 0]
 
-    total_pnl = sum(t.pnl_pct for t in closed)
-    avg_pnl = total_pnl / len(closed)
-    avg_win = sum(t.pnl_pct for t in wins) / len(wins) if wins else 0
-    avg_loss = sum(t.pnl_pct for t in losses) / len(losses) if losses else 0
-    win_rate = len(wins) / len(closed) * 100
+    # Weight-aware metrics
+    total_weight = sum(t.weight for t in closed)
+    win_weight = sum(t.weight for t in wins)
+    loss_weight = sum(t.weight for t in losses)
 
-    # By direction
+    total_pnl = sum(t.pnl_pct * t.weight for t in closed)
+    avg_pnl = total_pnl / total_weight if total_weight > 0 else 0
+    avg_win = _weighted_avg(wins)
+    avg_loss = _weighted_avg(losses)
+    win_rate = win_weight / total_weight * 100 if total_weight > 0 else 0
+
+    # By direction (weighted)
     short_wins = [t for t in shorts if t.pnl_pct > 0]
     short_losses = [t for t in shorts if t.pnl_pct <= 0]
     long_wins = [t for t in longs if t.pnl_pct > 0]
     long_losses = [t for t in longs if t.pnl_pct <= 0]
 
-    short_wr = len(short_wins) / len(shorts) * 100 if shorts else 0
-    long_wr = len(long_wins) / len(longs) * 100 if longs else 0
-    short_avg = sum(t.pnl_pct for t in shorts) / len(shorts) if shorts else 0
-    long_avg = sum(t.pnl_pct for t in longs) / len(longs) if longs else 0
+    short_wt = sum(t.weight for t in shorts)
+    long_wt = sum(t.weight for t in longs)
+    short_win_wt = sum(t.weight for t in short_wins)
+    long_win_wt = sum(t.weight for t in long_wins)
+    short_wr = short_win_wt / short_wt * 100 if short_wt > 0 else 0
+    long_wr = long_win_wt / long_wt * 100 if long_wt > 0 else 0
+    short_avg = _weighted_avg(shorts)
+    long_avg = _weighted_avg(longs)
 
     # By exit reason
     stops = [t for t in closed if t.exit_reason == "STOP"]
     t10 = [t for t in closed if t.exit_reason == "TARGET_10MA"]
+    t10p = [t for t in closed if t.exit_reason == "TARGET_10MA_PARTIAL"]
     t20 = [t for t in closed if t.exit_reason == "TARGET_20MA"]
+    sbe = [t for t in closed if t.exit_reason == "STOP_BREAKEVEN"]
     timeouts = [t for t in closed if t.exit_reason == "TIMEOUT"]
 
-    # Profit factor
-    gross_profit = sum(t.pnl_pct for t in wins) if wins else 0
-    gross_loss = abs(sum(t.pnl_pct for t in losses)) if losses else 0
+    # Profit factor (weighted)
+    gross_profit = sum(t.pnl_pct * t.weight for t in wins) if wins else 0
+    gross_loss = abs(sum(t.pnl_pct * t.weight for t in losses)) if losses else 0
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
-    # Max drawdown (sequential PnL)
+    # Max drawdown (sequential weighted PnL)
     cumulative = 0.0
     peak_cum = 0.0
     max_dd = 0.0
-    for t in sorted(closed, key=lambda x: x.entry_bar):
-        cumulative += t.pnl_pct
+    for t in sorted(closed, key=lambda x: (x.exit_bar, -x.is_runner)):
+        cumulative += t.pnl_pct * t.weight
         if cumulative > peak_cum:
             peak_cum = cumulative
         dd = peak_cum - cumulative
         if dd > max_dd:
             max_dd = dd
 
-    # Average R-multiple
-    r_values = [t.r_multiple for t in closed if t.risk_pct > 0]
-    avg_r = sum(r_values) / len(r_values) if r_values else 0
+    # Average R-multiple (weighted)
+    r_trades = [t for t in closed if t.risk_pct > 0]
+    r_wt = sum(t.weight for t in r_trades)
+    avg_r = sum(t.r_multiple * t.weight for t in r_trades) / r_wt if r_wt > 0 else 0
 
-    # Best and worst trades
-    best = max(closed, key=lambda t: t.pnl_pct)
-    worst = min(closed, key=lambda t: t.pnl_pct)
+    # Best and worst trades (by weighted PnL)
+    best = max(closed, key=lambda t: t.pnl_pct * t.weight)
+    worst = min(closed, key=lambda t: t.pnl_pct * t.weight)
 
     # Avg holding period
     avg_bars = sum(t.bars_held for t in closed) / len(closed)
@@ -732,13 +827,13 @@ def print_grand_summary(all_trades: list):
     print("                    GRAND BACKTEST SUMMARY — Parabolic Mean Reversion V1")
     print("=" * 100)
 
-    print(f"\n  Total Closed Trades:     {len(closed)}")
+    print(f"\n  Original Setups:         {n_setups}")
+    print(f"  Total Trade Legs:        {len(closed)}  (includes runner legs from split exits)")
     print(f"  Tickers With Setups:     {tickers_with_trades}")
-    print(f"  Total Setups Generated:  {len(all_trades)}")
     print(f"  Open at End (excluded):  {len(all_trades) - len(closed)}")
 
-    print(f"\n  ── Overall Performance ──")
-    print(f"  Win Rate:                {win_rate:.1f}% ({len(wins)}W / {len(losses)}L)")
+    print(f"\n  ── Overall Performance (weighted) ──")
+    print(f"  Win Rate:                {win_rate:.1f}% ({win_weight:.1f}W / {loss_weight:.1f}L weighted)")
     print(f"  Avg PnL per Trade:       {avg_pnl:+.2f}%")
     print(f"  Avg Winner:              {avg_win:+.2f}%")
     print(f"  Avg Loser:               {avg_loss:+.2f}%")
@@ -748,74 +843,83 @@ def print_grand_summary(all_trades: list):
     print(f"  Max Drawdown (seq):      {max_dd:.2f}%")
     print(f"  Avg Holding Period:      {avg_bars:.1f} bars")
 
-    print(f"\n  ── By Direction ──")
-    print(f"  SHORT:  {len(shorts):>4} trades | Win Rate: {short_wr:>5.1f}% | Avg PnL: {short_avg:>+7.2f}%")
+    print(f"\n  ── By Direction (weighted) ──")
+    short_setups = len([t for t in shorts if not t.is_runner])
+    long_setups = len([t for t in longs if not t.is_runner])
+    print(f"  SHORT:  {short_setups:>4} setups ({len(shorts)} legs) | Win Rate: {short_wr:>5.1f}% | Avg PnL: {short_avg:>+7.2f}%")
     if shorts:
-        short_avg_win = sum(t.pnl_pct for t in short_wins) / len(short_wins) if short_wins else 0
-        short_avg_loss = sum(t.pnl_pct for t in short_losses) / len(short_losses) if short_losses else 0
-        print(f"           Avg Win: {short_avg_win:>+7.2f}% | Avg Loss: {short_avg_loss:>+7.2f}%")
-    print(f"  LONG:   {len(longs):>4} trades | Win Rate: {long_wr:>5.1f}% | Avg PnL: {long_avg:>+7.2f}%")
+        print(f"           Avg Win: {_weighted_avg(short_wins):>+7.2f}% | Avg Loss: {_weighted_avg(short_losses):>+7.2f}%")
+    print(f"  LONG:   {long_setups:>4} setups ({len(longs)} legs) | Win Rate: {long_wr:>5.1f}% | Avg PnL: {long_avg:>+7.2f}%")
     if longs:
-        long_avg_win = sum(t.pnl_pct for t in long_wins) / len(long_wins) if long_wins else 0
-        long_avg_loss = sum(t.pnl_pct for t in long_losses) / len(long_losses) if long_losses else 0
-        print(f"           Avg Win: {long_avg_win:>+7.2f}% | Avg Loss: {long_avg_loss:>+7.2f}%")
+        print(f"           Avg Win: {_weighted_avg(long_wins):>+7.2f}% | Avg Loss: {_weighted_avg(long_losses):>+7.2f}%")
 
     print(f"\n  ── By Exit Reason ──")
-    print(f"  STOP:        {len(stops):>4}  ({len(stops)/len(closed)*100:>5.1f}%)  Avg PnL: {sum(t.pnl_pct for t in stops)/len(stops) if stops else 0:>+7.2f}%")
-    print(f"  TARGET_10MA: {len(t10):>4}  ({len(t10)/len(closed)*100:>5.1f}%)  Avg PnL: {sum(t.pnl_pct for t in t10)/len(t10) if t10 else 0:>+7.2f}%")
-    print(f"  TARGET_20MA: {len(t20):>4}  ({len(t20)/len(closed)*100:>5.1f}%)  Avg PnL: {sum(t.pnl_pct for t in t20)/len(t20) if t20 else 0:>+7.2f}%")
-    print(f"  TIMEOUT:     {len(timeouts):>4}  ({len(timeouts)/len(closed)*100:>5.1f}%)  Avg PnL: {sum(t.pnl_pct for t in timeouts)/len(timeouts) if timeouts else 0:>+7.2f}%")
+    n = len(closed)
+    def _reason_line(label, bucket):
+        pct = len(bucket) / n * 100 if n else 0
+        avg = _weighted_avg(bucket) if bucket else 0
+        wt = sum(t.weight for t in bucket)
+        print(f"  {label:<19} {len(bucket):>4}  ({pct:>5.1f}%)  Wt: {wt:>5.1f}  Avg PnL: {avg:>+7.2f}%")
+    _reason_line("STOP:", stops)
+    _reason_line("TARGET_10MA:", t10)
+    _reason_line("TARGET_10MA_PARTIAL:", t10p)
+    _reason_line("TARGET_20MA:", t20)
+    _reason_line("STOP_BREAKEVEN:", sbe)
+    _reason_line("TIMEOUT:", timeouts)
 
     print(f"\n  ── Extremes ──")
-    print(f"  Best Trade:   {best.ticker} {best.direction} {best.entry_date} → {best.exit_date}  PnL: {best.pnl_pct:+.2f}%  ({best.exit_reason})")
-    print(f"  Worst Trade:  {worst.ticker} {worst.direction} {worst.entry_date} → {worst.exit_date}  PnL: {worst.pnl_pct:+.2f}%  ({worst.exit_reason})")
+    print(f"  Best Trade:   {best.ticker} {best.direction} {best.entry_date} → {best.exit_date}  PnL: {best.pnl_pct:+.2f}% x{best.weight:.0%}  ({best.exit_reason})")
+    print(f"  Worst Trade:  {worst.ticker} {worst.direction} {worst.entry_date} → {worst.exit_date}  PnL: {worst.pnl_pct:+.2f}% x{worst.weight:.0%}  ({worst.exit_reason})")
 
     # Top 10 trades
-    sorted_trades = sorted(closed, key=lambda t: t.pnl_pct, reverse=True)
+    sorted_trades = sorted(closed, key=lambda t: t.pnl_pct * t.weight, reverse=True)
     print(f"\n  ── Top 10 Trades ──")
-    print(f"  {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Exit':>10} {'PnL%':>8} {'R':>6} {'Exit Reason':<14} {'Bars':>5}")
-    print(f"  {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*8} {'-'*6} {'-'*14} {'-'*5}")
+    print(f"  {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Exit':>10} {'PnL%':>8} {'Wt':>4} {'R':>6} {'Exit Reason':<20} {'Bars':>5}")
+    print(f"  {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*8} {'-'*4} {'-'*6} {'-'*20} {'-'*5}")
     for t in sorted_trades[:10]:
         print(f"  {t.ticker:<8} {t.direction:<6} {t.entry_date:<12} {t.exit_date:<12} "
-              f"{t.entry_price:>10.2f} {t.exit_price:>10.2f} {t.pnl_pct:>+7.2f}% {t.r_multiple:>+5.2f}R "
-              f"{t.exit_reason:<14} {t.bars_held:>5}")
+              f"{t.entry_price:>10.2f} {t.exit_price:>10.2f} {t.pnl_pct:>+7.2f}% {t.weight:>3.0%} {t.r_multiple:>+5.2f}R "
+              f"{t.exit_reason:<20} {t.bars_held:>5}")
 
     # Bottom 10 trades
     print(f"\n  ── Bottom 10 Trades ──")
-    print(f"  {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Exit':>10} {'PnL%':>8} {'R':>6} {'Exit Reason':<14} {'Bars':>5}")
-    print(f"  {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*8} {'-'*6} {'-'*14} {'-'*5}")
+    print(f"  {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Exit':>10} {'PnL%':>8} {'Wt':>4} {'R':>6} {'Exit Reason':<20} {'Bars':>5}")
+    print(f"  {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*8} {'-'*4} {'-'*6} {'-'*20} {'-'*5}")
     for t in sorted_trades[-10:]:
         print(f"  {t.ticker:<8} {t.direction:<6} {t.entry_date:<12} {t.exit_date:<12} "
-              f"{t.entry_price:>10.2f} {t.exit_price:>10.2f} {t.pnl_pct:>+7.2f}% {t.r_multiple:>+5.2f}R "
-              f"{t.exit_reason:<14} {t.bars_held:>5}")
+              f"{t.entry_price:>10.2f} {t.exit_price:>10.2f} {t.pnl_pct:>+7.2f}% {t.weight:>3.0%} {t.r_multiple:>+5.2f}R "
+              f"{t.exit_reason:<20} {t.bars_held:>5}")
 
-    # Per-ticker breakdown
-    print(f"\n  ── Per-Ticker Breakdown ──")
-    print(f"  {'Ticker':<8} {'Trades':>7} {'Short':>6} {'Long':>6} {'Win%':>7} {'Avg PnL':>9} {'Total PnL':>10} {'Best':>8} {'Worst':>8}")
-    print(f"  {'-'*8} {'-'*7} {'-'*6} {'-'*6} {'-'*7} {'-'*9} {'-'*10} {'-'*8} {'-'*8}")
+    # Per-ticker breakdown (weighted)
+    print(f"\n  ── Per-Ticker Breakdown (weighted PnL) ──")
+    print(f"  {'Ticker':<8} {'Setups':>7} {'Legs':>6} {'Short':>6} {'Long':>6} {'Win%':>7} {'Avg PnL':>9} {'Total PnL':>10} {'Best':>8} {'Worst':>8}")
+    print(f"  {'-'*8} {'-'*7} {'-'*6} {'-'*6} {'-'*6} {'-'*7} {'-'*9} {'-'*10} {'-'*8} {'-'*8}")
 
     tickers = sorted(set(t.ticker for t in closed))
     for tkr in tickers:
         tkr_trades = [t for t in closed if t.ticker == tkr]
-        tkr_shorts = [t for t in tkr_trades if t.direction == "SHORT"]
-        tkr_longs = [t for t in tkr_trades if t.direction == "LONG"]
+        tkr_setups = [t for t in tkr_trades if not t.is_runner]
+        tkr_shorts = [t for t in tkr_setups if t.direction == "SHORT"]
+        tkr_longs = [t for t in tkr_setups if t.direction == "LONG"]
         tkr_wins = [t for t in tkr_trades if t.pnl_pct > 0]
-        tkr_wr = len(tkr_wins) / len(tkr_trades) * 100 if tkr_trades else 0
-        tkr_avg = sum(t.pnl_pct for t in tkr_trades) / len(tkr_trades) if tkr_trades else 0
-        tkr_total = sum(t.pnl_pct for t in tkr_trades)
-        tkr_best = max(t.pnl_pct for t in tkr_trades) if tkr_trades else 0
-        tkr_worst = min(t.pnl_pct for t in tkr_trades) if tkr_trades else 0
-        print(f"  {tkr:<8} {len(tkr_trades):>7} {len(tkr_shorts):>6} {len(tkr_longs):>6} "
+        tkr_wt = sum(t.weight for t in tkr_trades)
+        tkr_win_wt = sum(t.weight for t in tkr_wins)
+        tkr_wr = tkr_win_wt / tkr_wt * 100 if tkr_wt > 0 else 0
+        tkr_avg = _weighted_avg(tkr_trades)
+        tkr_total = sum(t.pnl_pct * t.weight for t in tkr_trades)
+        tkr_best = max(t.pnl_pct * t.weight for t in tkr_trades) if tkr_trades else 0
+        tkr_worst = min(t.pnl_pct * t.weight for t in tkr_trades) if tkr_trades else 0
+        print(f"  {tkr:<8} {len(tkr_setups):>7} {len(tkr_trades):>6} {len(tkr_shorts):>6} {len(tkr_longs):>6} "
               f"{tkr_wr:>6.1f}% {tkr_avg:>+8.2f}% {tkr_total:>+9.2f}% {tkr_best:>+7.2f}% {tkr_worst:>+7.2f}%")
 
     # All closed trades log
-    print(f"\n  ── Complete Trade Log ({len(closed)} closed trades) ──")
-    print(f"  {'#':>4} {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Stop':>10} {'Exit':>10} {'PnL%':>8} {'R':>6} {'Reason':<14} {'Bars':>5} {'Ext%':>7} {'Gain%':>7}")
-    print(f"  {'-'*4} {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*8} {'-'*6} {'-'*14} {'-'*5} {'-'*7} {'-'*7}")
-    for idx, t in enumerate(sorted(closed, key=lambda x: (x.ticker, x.entry_bar)), 1):
+    print(f"\n  ── Complete Trade Log ({len(closed)} legs from {n_setups} setups) ──")
+    print(f"  {'#':>4} {'Ticker':<8} {'Dir':<6} {'Entry Date':<12} {'Exit Date':<12} {'Entry':>10} {'Stop':>10} {'Exit':>10} {'PnL%':>8} {'Wt':>4} {'R':>6} {'Reason':<20} {'Bars':>5} {'Ext%':>7} {'Gain%':>7}")
+    print(f"  {'-'*4} {'-'*8} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*8} {'-'*4} {'-'*6} {'-'*20} {'-'*5} {'-'*7} {'-'*7}")
+    for idx, t in enumerate(sorted(closed, key=lambda x: (x.ticker, x.entry_bar, x.is_runner)), 1):
         print(f"  {idx:>4} {t.ticker:<8} {t.direction:<6} {t.entry_date:<12} {t.exit_date:<12} "
               f"{t.entry_price:>10.2f} {t.stop_price:>10.2f} {t.exit_price:>10.2f} "
-              f"{t.pnl_pct:>+7.2f}% {t.r_multiple:>+5.2f}R {t.exit_reason:<14} {t.bars_held:>5} "
+              f"{t.pnl_pct:>+7.2f}% {t.weight:>3.0%} {t.r_multiple:>+5.2f}R {t.exit_reason:<20} {t.bars_held:>5} "
               f"{t.extension_pct:>+6.1f}% {t.rolling_gain_pct:>+6.1f}%")
 
     print("\n" + "=" * 100)
@@ -880,13 +984,14 @@ def main():
     print(f"    Setup Timeout:       {cfg.short_setup_timeout} / {cfg.long_setup_timeout} bars")
     print(f"    Cooldown:            {cfg.cooldown_bars} bars")
     print(f"    Max Trade Duration:  {cfg.max_trade_bars} bars")
+    print(f"    Split Exit:          {cfg.split_exit} ({cfg.split_pct}% at 10MA, {100-cfg.split_pct}% runner to 20MA)")
     print(f"    Volume Gates:        BYPASSED (no volume in data)")
     print(f"    ADR Filter:          {cfg.use_adr_filter} (max {cfg.max_stop_vs_adr}x ADR)")
     print(f"    Min Price:           ${cfg.min_price}")
     print(f"    Min ADR:             {cfg.min_adr_pct}%")
 
     print(f"\n  ── Per-Ticker Results ──")
-    print(f"  {'Ticker':<8} | {'Total':>6} | {'Short':>6} | {'Long':>6} | {'Closed':>7} | {'Win%':>7} | "
+    print(f"  {'Ticker':<8} | {'Total':>6} | {'Short':>6} | {'Long':>6} | {'Legs':>7} | {'Win%':>7} | "
           f"{'Avg PnL':>9} | {'Avg Win':>9} | {'Avg Loss':>9} | {'Avg Bars':>9}")
     print(f"  {'-' * 100}")
 
