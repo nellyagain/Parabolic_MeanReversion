@@ -2,9 +2,9 @@
 """
 Parabolic Snapback & Washout [Daily Screener V1] — Comprehensive Backtester
 
-Replicates the Pine Script V1 logic from the architecture plan against CSV OHLC data.
-Since the chart data has no volume column, volume-dependent gates (climax volume,
-RVOL, dollar volume filter) are bypassed. All price-based detection, state machines,
+Replicates the Pine Script V1 logic from the architecture plan against CSV OHLCV data.
+Includes volume-dependent gates (climax volume via RVOL, dollar volume filter) and
+Run AVWAP trigger modes matching the Pine Script. All detection, state machines,
 triggers, risk management, and targets operate identically to the Pine Script.
 
 Trade outcome tracking:
@@ -56,15 +56,17 @@ class Config:
     prior_run_min_pct: float = 40.0   # Calibrated for large-cap (plan default: 100)
     prior_run_lookback: int = 60      # Wider lookback (plan default: 40)
 
-    # Climax Volume (bypassed — no volume data)
-    use_climax_vol: bool = False  # Disabled for backtest
+    # Climax Volume
+    use_climax_vol: bool = True
     rvol_threshold: float = 3.0
     rvol_baseline: int = 20
     climax_window_bars: int = 1
 
-    # Liquidity Filters (price-only; dollar vol bypassed)
+    # Liquidity Filters
     min_price: float = 5.0
     min_adr_pct: float = 1.0         # Lowered for stable large-caps (plan default: 2)
+    min_avg_dollar_vol: float = 20.0  # Min avg dollar volume in millions
+    dollar_vol_len: int = 20
 
     # Setup Trigger (Daily Proxy)
     short_trigger: str = "Close < Prior Low"
@@ -117,6 +119,7 @@ class Bar:
     high: float
     low: float
     close: float
+    volume: float = 0.0
     ohlc4: float = 0.0
 
     def __post_init__(self):
@@ -189,13 +192,22 @@ def bb_upper(closes: list, length: int, mult: float) -> float:
 
 
 def load_csv(filepath: str) -> list:
-    """Load OHLC CSV data into Bar objects."""
+    """Load OHLCV CSV data into Bar objects."""
     bars = []
     with open(filepath, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
             ts = int(row['time'])
             dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            # Volume column may be 'Volume' or 'volume'
+            vol = 0.0
+            for vk in ('Volume', 'volume', 'vol'):
+                if vk in row:
+                    try:
+                        vol = float(row[vk])
+                    except (ValueError, TypeError):
+                        pass
+                    break
             bars.append(Bar(
                 timestamp=ts,
                 date=dt.strftime('%Y-%m-%d'),
@@ -203,6 +215,7 @@ def load_csv(filepath: str) -> list:
                 high=float(row['high']),
                 low=float(row['low']),
                 close=float(row['close']),
+                volume=vol,
             ))
     return bars
 
@@ -235,6 +248,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
     closes = []
     highs = []
     lows = []
+    volumes = []
+    dollar_vols = []  # close * volume per bar
     daily_range_pcts = []
 
     # Short state machine
@@ -253,6 +268,18 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
     washout_low_bar = -1
     last_long_bar = -999
 
+    # Climax volume tracking
+    last_climax_bar = -999
+
+    # Run AVWAP accumulators
+    short_avwap_num = 0.0
+    short_avwap_den = 0.0
+    short_run_avwap = 0.0
+    long_avwap_num = 0.0
+    long_avwap_den = 0.0
+    long_run_avwap = 0.0
+    long_peak_bar_idx = -1  # for AVWAP anchor
+
     # Green streak
     green_streak = 0
 
@@ -264,6 +291,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
         closes.append(bar.close)
         highs.append(bar.high)
         lows.append(bar.low)
+        volumes.append(bar.volume)
+        dollar_vols.append(bar.close * bar.volume)
 
         # ── Track open trades ──
         new_open_trades = []
@@ -439,11 +468,14 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
             continue
 
         # ═══════════════════════════════════════════════════════════
-        # LIQUIDITY GATE (price-only, no volume data)
+        # LIQUIDITY GATE
         # ═══════════════════════════════════════════════════════════
         adr_pct = sma(daily_range_pcts, cfg.adr_len)
+        avg_dollar_vol = sma(dollar_vols, cfg.dollar_vol_len) / 1e6  # in millions
 
-        liquidity_ok = bar.close >= cfg.min_price and adr_pct >= cfg.min_adr_pct
+        liquidity_ok = (bar.close >= cfg.min_price
+                        and adr_pct >= cfg.min_adr_pct
+                        and avg_dollar_vol >= cfg.min_avg_dollar_vol)
 
         # ═══════════════════════════════════════════════════════════
         # PARABOLIC ADVANCE DETECTION
@@ -482,8 +514,19 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                                       has_green_streak and is_extended and
                                       bb_ok and trend_ok)
 
-        # Climax volume bypassed (no volume data)
-        climax_vol_ok = True
+        # ═══════════════════════════════════════════════════════════
+        # CLIMAX VOLUME DETECTION
+        # ═══════════════════════════════════════════════════════════
+        vol_baseline = sma(volumes, cfg.rvol_baseline)
+        rvol = bar.volume / vol_baseline if vol_baseline > 0 else 0.0
+        is_climax_volume = rvol >= cfg.rvol_threshold
+
+        if is_climax_volume:
+            last_climax_bar = i
+
+        # Gate: climax must be within N bars of current bar
+        climax_aligned = (i - last_climax_bar) <= cfg.climax_window_bars
+        climax_vol_ok = climax_aligned if cfg.use_climax_vol else True
 
         # ═══════════════════════════════════════════════════════════
         # WASHOUT CRASH DETECTION (Long Side)
@@ -533,11 +576,22 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
             # AVWAP anchor
             advance_start_low = recent_low
             advance_start_bar = i - cfg.gain_lookback + 1 + (window_lows.index(recent_low) if recent_low in window_lows else 0)
+            # Initialize Run AVWAP accumulators
+            short_avwap_num = 0.0
+            short_avwap_den = 0.0
+            short_run_avwap = 0.0
 
         # PEAK TRACKING
         if short_setup_active and bar.high > parabolic_peak:
             parabolic_peak = bar.high
             parabolic_peak_bar = i
+
+        # Run AVWAP accumulation (short side)
+        if short_setup_active:
+            src = bar.ohlc4
+            short_avwap_num += src * bar.volume
+            short_avwap_den += bar.volume
+            short_run_avwap = short_avwap_num / short_avwap_den if short_avwap_den > 0 else 0.0
 
         # TRIGGER
         if short_setup_active and (i - short_setup_bar) >= cfg.min_bars_after_setup:
@@ -546,10 +600,13 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 short_entry_proxy = bar.close < bar.open and i > 0 and bar.close < bars[i - 1].close
             elif cfg.short_trigger == "Close < Prior Low":
                 short_entry_proxy = i > 0 and bar.close < bars[i - 1].low
+            elif cfg.short_trigger == "Close < Run AVWAP":
+                short_entry_proxy = short_run_avwap > 0 and bar.close < short_run_avwap
             elif cfg.short_trigger == "Any Reversal":
                 short_entry_proxy = (
                     (i > 0 and bar.close < bars[i - 1].low) or
-                    (bar.close < bar.open and i > 0 and bar.close < bars[i - 1].close)
+                    (bar.close < bar.open and i > 0 and bar.close < bars[i - 1].close) or
+                    (short_run_avwap > 0 and bar.close < short_run_avwap)
                 )
             # Close strength
             bar_rng = max(bar.high - bar.low, 0.0001)
@@ -597,10 +654,16 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 # Reset
                 short_setup_active = False
                 last_short_bar = i
+                short_avwap_num = 0.0
+                short_avwap_den = 0.0
+                short_run_avwap = 0.0
 
         # TIMEOUT
         if short_setup_active and (i - short_setup_bar > cfg.short_setup_timeout):
             short_setup_active = False
+            short_avwap_num = 0.0
+            short_avwap_den = 0.0
+            short_run_avwap = 0.0
 
         # ═══════════════════════════════════════════════════════════
         # LONG SETUP STATE MACHINE
@@ -614,11 +677,22 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
             long_setup_bar = i
             washout_low = bar.low
             washout_low_bar = i
+            # Initialize long-side Run AVWAP from peak
+            long_avwap_num = 0.0
+            long_avwap_den = 0.0
+            long_run_avwap = 0.0
 
         # LOW TRACKING
         if long_setup_active and bar.low < washout_low:
             washout_low = bar.low
             washout_low_bar = i
+
+        # Run AVWAP accumulation (long side, anchored from peak)
+        if long_setup_active:
+            src = bar.ohlc4
+            long_avwap_num += src * bar.volume
+            long_avwap_den += bar.volume
+            long_run_avwap = long_avwap_num / long_avwap_den if long_avwap_den > 0 else 0.0
 
         # TRIGGER
         if long_setup_active and (i - long_setup_bar) >= cfg.min_bars_after_setup:
@@ -627,10 +701,13 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 long_entry_proxy = bar.close > bar.open and i > 0 and bar.close > bars[i - 1].close
             elif cfg.long_trigger == "Close > Prior High":
                 long_entry_proxy = i > 0 and bar.close > bars[i - 1].high
+            elif cfg.long_trigger == "Close > Run AVWAP":
+                long_entry_proxy = long_run_avwap > 0 and bar.close > long_run_avwap
             elif cfg.long_trigger == "Any Reversal":
                 long_entry_proxy = (
                     (i > 0 and bar.close > bars[i - 1].high) or
-                    (bar.close > bar.open and i > 0 and bar.close > bars[i - 1].close)
+                    (bar.close > bar.open and i > 0 and bar.close > bars[i - 1].close) or
+                    (long_run_avwap > 0 and bar.close > long_run_avwap)
                 )
 
             bar_rng = max(bar.high - bar.low, 0.0001)
@@ -673,10 +750,16 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 # Reset
                 long_setup_active = False
                 last_long_bar = i
+                long_avwap_num = 0.0
+                long_avwap_den = 0.0
+                long_run_avwap = 0.0
 
         # TIMEOUT
         if long_setup_active and (i - long_setup_bar > cfg.long_setup_timeout):
             long_setup_active = False
+            long_avwap_num = 0.0
+            long_avwap_den = 0.0
+            long_run_avwap = 0.0
 
     # Close any remaining open trades at last bar
     if open_trades:
@@ -985,7 +1068,8 @@ def main():
     print(f"    Cooldown:            {cfg.cooldown_bars} bars")
     print(f"    Max Trade Duration:  {cfg.max_trade_bars} bars")
     print(f"    Split Exit:          {cfg.split_exit} ({cfg.split_pct}% at 10MA, {100-cfg.split_pct}% runner to 20MA)")
-    print(f"    Volume Gates:        BYPASSED (no volume in data)")
+    print(f"    Climax Volume:       {cfg.use_climax_vol} (RVOL >= {cfg.rvol_threshold}x, window {cfg.climax_window_bars} bars)")
+    print(f"    Dollar Vol Filter:   >= ${cfg.min_avg_dollar_vol}M avg")
     print(f"    ADR Filter:          {cfg.use_adr_filter} (max {cfg.max_stop_vs_adr}x ADR)")
     print(f"    Min Price:           ${cfg.min_price}")
     print(f"    Min ADR:             {cfg.min_adr_pct}%")
