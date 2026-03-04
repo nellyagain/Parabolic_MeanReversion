@@ -89,11 +89,11 @@ class Config:
     gap_exclusion_atr_mult: float = 2.0
 
     # ── V8: SHORT minimum reward filter ──
-    short_min_reward_pct: float = 0.0     # V8: disabled (entry filters reduce sample too much)
+    short_min_reward_pct: float = 3.0     # V8: only short if 10MA target >= 3% below entry
 
     # ── LONG side — Stop Management ──
     long_stop_cap_atr_mult: float = 2.0   # V6: cap structural stop at 2x ATR from entry
-    long_max_stop_pct: float = 0.0        # V8: disabled (tighter stops create more stop-outs)
+    long_max_stop_pct: float = 20.0       # V8: hard-cap LONG stop at 20% from entry (clips worst outliers)
     # ── LONG side — Exit Model ──
     long_exit_mode: str = "v5_hybrid"  # "v5_hybrid" or "v4_legacy"
     long_r1_target: float = 1.5
@@ -1628,6 +1628,67 @@ def print_grand_summary(all_trades: list, label: str = "V5 HYBRID"):
         print(f"  Avg Absorption Score:    {avg_abs:.3f}")
         print(f"  Spring Detected:         {spring_pct:.1f}%")
         print(f"  Avg Breakout RVOL:       {avg_bvol:.2f}x")
+
+    # ── V8: Risk-Normalized Performance ──
+    # Simulate 2% portfolio risk per trade: position_size = 2% / risk_pct
+    risk_target = 2.0  # % portfolio risk per trade
+    rn_trades = [t for t in closed if t.risk_pct > 0]
+    if rn_trades:
+        rn_pnls = []
+        for t in rn_trades:
+            pos_size = min(risk_target / t.risk_pct, 1.0)  # cap at 100% position
+            rn_pnl = t.pnl_pct * t.weight * pos_size
+            rn_pnls.append(rn_pnl)
+        rn_total = sum(rn_pnls)
+        rn_wins = [p for p in rn_pnls if p > 0]
+        rn_losses = [p for p in rn_pnls if p <= 0]
+        rn_gross_profit = sum(rn_wins) if rn_wins else 0
+        rn_gross_loss = abs(sum(rn_losses)) if rn_losses else 0
+        rn_pf = rn_gross_profit / rn_gross_loss if rn_gross_loss > 0 else float('inf')
+
+        # Risk-normalized drawdown
+        rn_cum = 0.0
+        rn_peak = 0.0
+        rn_max_dd = 0.0
+        for p in rn_pnls:
+            rn_cum += p
+            if rn_cum > rn_peak:
+                rn_peak = rn_cum
+            dd = rn_peak - rn_cum
+            if dd > rn_max_dd:
+                rn_max_dd = dd
+
+        print(f"\n  ── Risk-Normalized Performance (2% risk/trade) ──")
+        print(f"  Cumulative PnL:          {rn_total:+.2f}% (portfolio terms)")
+        print(f"  Profit Factor:           {rn_pf:.2f}")
+        print(f"  Max Drawdown:            {rn_max_dd:.2f}% (portfolio terms)")
+        print(f"  Avg PnL per Trade:       {rn_total / len(rn_pnls):+.2f}%")
+        print(f"  Worst Single Trade:      {min(rn_pnls):+.2f}%")
+
+    # ── V8: Concentration Analysis ──
+    ticker_pnls = {}
+    for t in closed:
+        ticker_pnls.setdefault(t.ticker, 0.0)
+        ticker_pnls[t.ticker] += t.pnl_pct * t.weight
+    sorted_tickers = sorted(ticker_pnls.items(), key=lambda x: x[1], reverse=True)
+
+    if sorted_tickers and total_pnl != 0:
+        top1_tkr, top1_pnl = sorted_tickers[0]
+        top2_tkr, top2_pnl = sorted_tickers[1] if len(sorted_tickers) > 1 else ("", 0)
+        top1_pct = top1_pnl / total_pnl * 100 if total_pnl > 0 else 0
+        top2_pct = (top1_pnl + top2_pnl) / total_pnl * 100 if total_pnl > 0 else 0
+        ex_top1_pnl = total_pnl - top1_pnl
+        ex_top2_pnl = total_pnl - top1_pnl - top2_pnl
+
+        print(f"\n  ── Concentration Analysis ──")
+        print(f"  Top Contributor:         {top1_tkr} = {top1_pnl:+.2f}% ({top1_pct:.1f}% of total PnL)")
+        print(f"  Top 2 Contributors:      {top1_tkr}+{top2_tkr} = {top1_pnl + top2_pnl:+.2f}% ({top2_pct:.1f}% of total PnL)")
+        print(f"  Ex-Top-1 PnL:            {ex_top1_pnl:+.2f}%")
+        print(f"  Ex-Top-2 PnL:            {ex_top2_pnl:+.2f}%")
+        n_profitable_tickers = sum(1 for _, p in sorted_tickers if p > 0)
+        n_losing_tickers = sum(1 for _, p in sorted_tickers if p <= 0)
+        print(f"  Profitable Tickers:      {n_profitable_tickers}/{len(sorted_tickers)} ({n_profitable_tickers / len(sorted_tickers) * 100:.0f}%)")
+        print(f"  Losing Tickers:          {n_losing_tickers}/{len(sorted_tickers)}")
 
     # Complete trade log
     print(f"\n  ── Complete Trade Log ({len(closed)} legs from {n_setups} setups) ──")
