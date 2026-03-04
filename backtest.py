@@ -20,9 +20,9 @@ import os
 import sys
 import glob
 import math
+import argparse
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -826,12 +826,27 @@ def print_grand_summary(all_trades: list):
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs2")
-    if not os.path.isdir(data_dir):
-        # Try alternate path
-        data_dir = "/home/user/logs2"
-    if not os.path.isdir(data_dir):
-        print(f"ERROR: Data directory not found: {data_dir}")
+    parser = argparse.ArgumentParser(description="Run Parabolic Mean Reversion backtest on OHLC CSVs")
+    parser.add_argument(
+        "--data-dir",
+        help="Directory containing OHLC CSV files (defaults to auto-discovery)",
+    )
+    args = parser.parse_args()
+
+    candidates = []
+    if args.data_dir:
+        candidates.append(args.data_dir)
+    candidates.extend([
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs2"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs2"),
+        "/home/user/logs2",
+    ])
+
+    data_dir = next((d for d in candidates if os.path.isdir(d)), None)
+    if not data_dir:
+        print("ERROR: Data directory not found. Checked:")
+        for d in candidates:
+            print(f"  - {d}")
         sys.exit(1)
 
     csv_files = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
