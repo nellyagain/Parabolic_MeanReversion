@@ -48,16 +48,19 @@ class Config:
     use_ext_bb_filter: bool = False
     bb_dev_mult: float = 3.0
 
-    # Parabolic LONG — Washout Detection
+    # Parabolic LONG — Washout Detection (V2: velocity + selling climax)
     enable_long: bool = True
     min_crash_pct: float = 30.0       # Calibrated for large-cap (plan default: 50)
     crash_window: int = 15            # Wider window for large-cap crashes (plan default: 5)
+    crash_velocity_min: float = 3.0   # V4: Min crash speed %/bar (sweep optimal: 3.0)
+    require_selling_climax: bool = True  # Require capitulation volume during crash
+    selling_climax_rvol: float = 3.0  # V4: RVOL threshold for selling climax (sweep optimal: 3.0)
     require_prior_run: bool = True
     prior_run_min_pct: float = 40.0   # Calibrated for large-cap (plan default: 100)
     prior_run_lookback: int = 60      # Wider lookback (plan default: 40)
 
     # Climax Volume
-    use_climax_vol: bool = True
+    use_climax_vol: bool = False      # V4: disabled — kills too many SHORT setups without improving quality
     rvol_threshold: float = 3.0
     rvol_baseline: int = 20
     climax_window_bars: int = 1
@@ -65,7 +68,7 @@ class Config:
     # Liquidity Filters
     min_price: float = 5.0
     min_adr_pct: float = 1.0         # Lowered for stable large-caps (plan default: 2)
-    min_avg_dollar_vol: float = 20.0  # Min avg dollar volume in millions
+    min_avg_dollar_vol: float = 0.0   # V4: disabled — reduces setup count without improving edge
     dollar_vol_len: int = 20
 
     # Setup Trigger (Daily Proxy)
@@ -92,11 +95,11 @@ class Config:
     max_stop_vs_adr: float = 1.5     # Tightened from 2.5x for loss containment (plan default: 1.0)
 
     # Risk Management
-    short_stop_mode: str = "Run Peak"
-    long_stop_mode: str = "Washout Low"
+    short_stop_mode: str = "Run Peak"    # V4: Run Peak best for shorts (ATR too tight for parabolic vol)
+    long_stop_mode: str = "ATR Based"    # V4: ATR-based (Washout Low too wide)
     stop_buffer: float = 0.2
     atr_len: int = 14
-    atr_mult: float = 2.0
+    atr_mult: float = 1.0           # V4: 1.0x ATR optimal for LONG washout bounce stops
 
     # Timeouts & Cooldown
     short_setup_timeout: int = 10     # More time for reversal (plan default: 5)
@@ -270,6 +273,7 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
 
     # Climax volume tracking
     last_climax_bar = -999
+    last_selling_climax_bar = -999  # For washout detection: high vol + red candle
 
     # Run AVWAP accumulators
     short_avwap_num = 0.0
@@ -303,8 +307,24 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 continue
 
             if t.direction == "SHORT":
-                # Check stop (price went above stop)
-                if bar.high >= t.stop_price:
+                # Determine if both stop and target are hit on same bar
+                stop_hit = bar.high >= t.stop_price
+                tgt_fast_hit = not t.is_runner and bar.low <= t.target_fast and t.target_fast < t.entry_price
+                tgt_slow_hit = bar.low <= t.target_slow and t.target_slow < t.entry_price
+
+                # Intrabar ambiguity resolution: if both stop and target hit,
+                # use proximity to open to decide which was hit first
+                if stop_hit and (tgt_fast_hit or tgt_slow_hit):
+                    dist_to_stop = abs(t.stop_price - bar.open)
+                    tgt_price = t.target_fast if tgt_fast_hit else t.target_slow
+                    dist_to_tgt = abs(tgt_price - bar.open)
+                    if dist_to_tgt <= dist_to_stop:
+                        stop_hit = False  # target was closer to open, hit first
+                    else:
+                        tgt_fast_hit = False
+                        tgt_slow_hit = False
+
+                if stop_hit:
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = t.stop_price
@@ -313,10 +333,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     t.bars_held = bars_held
                     if t.risk_pct > 0:
                         t.r_multiple = t.pnl_pct / t.risk_pct
-                # Check 10MA target (skip for runners — they target 20MA only)
-                elif not t.is_runner and bar.low <= t.target_fast and t.target_fast < t.entry_price:
+                elif tgt_fast_hit:
                     if cfg.split_exit:
-                        # Partial exit: close split_pct at 10MA
                         t.exit_bar = i
                         t.exit_date = bar.date
                         t.exit_price = t.target_fast
@@ -326,12 +344,11 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                         t.weight = cfg.split_pct / 100.0
                         if t.risk_pct > 0:
                             t.r_multiple = t.pnl_pct / t.risk_pct
-                        # Create runner for remaining portion
                         runner = Trade(
                             ticker=t.ticker, direction="SHORT",
                             entry_bar=t.entry_bar, entry_date=t.entry_date,
                             entry_price=t.entry_price,
-                            stop_price=t.entry_price,  # breakeven stop
+                            stop_price=t.entry_price,
                             target_fast=t.target_fast,
                             target_slow=t.target_slow,
                             extension_pct=t.extension_pct,
@@ -344,7 +361,6 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                         trades.append(runner)
                         new_open_trades.append(runner)
                     else:
-                        # Full exit at 10MA (original behavior)
                         t.exit_bar = i
                         t.exit_date = bar.date
                         t.exit_price = t.target_fast
@@ -353,8 +369,7 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                         t.bars_held = bars_held
                         if t.risk_pct > 0:
                             t.r_multiple = t.pnl_pct / t.risk_pct
-                # Check 20MA target
-                elif bar.low <= t.target_slow and t.target_slow < t.entry_price:
+                elif tgt_slow_hit:
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = t.target_slow
@@ -377,8 +392,23 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     continue
 
             elif t.direction == "LONG":
-                # Check stop (price went below stop)
-                if bar.low <= t.stop_price:
+                # Determine if both stop and target are hit on same bar
+                stop_hit = bar.low <= t.stop_price
+                tgt_fast_hit = not t.is_runner and bar.high >= t.target_fast and t.target_fast > t.entry_price
+                tgt_slow_hit = bar.high >= t.target_slow and t.target_slow > t.entry_price
+
+                # Intrabar ambiguity resolution
+                if stop_hit and (tgt_fast_hit or tgt_slow_hit):
+                    dist_to_stop = abs(t.stop_price - bar.open)
+                    tgt_price = t.target_fast if tgt_fast_hit else t.target_slow
+                    dist_to_tgt = abs(tgt_price - bar.open)
+                    if dist_to_tgt <= dist_to_stop:
+                        stop_hit = False
+                    else:
+                        tgt_fast_hit = False
+                        tgt_slow_hit = False
+
+                if stop_hit:
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = t.stop_price
@@ -387,10 +417,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     t.bars_held = bars_held
                     if t.risk_pct > 0:
                         t.r_multiple = t.pnl_pct / t.risk_pct
-                # Check 10MA target (skip for runners — they target 20MA only)
-                elif not t.is_runner and bar.high >= t.target_fast and t.target_fast > t.entry_price:
+                elif tgt_fast_hit:
                     if cfg.split_exit:
-                        # Partial exit: close split_pct at 10MA
                         t.exit_bar = i
                         t.exit_date = bar.date
                         t.exit_price = t.target_fast
@@ -400,12 +428,11 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                         t.weight = cfg.split_pct / 100.0
                         if t.risk_pct > 0:
                             t.r_multiple = t.pnl_pct / t.risk_pct
-                        # Create runner for remaining portion
                         runner = Trade(
                             ticker=t.ticker, direction="LONG",
                             entry_bar=t.entry_bar, entry_date=t.entry_date,
                             entry_price=t.entry_price,
-                            stop_price=t.entry_price,  # breakeven stop
+                            stop_price=t.entry_price,
                             target_fast=t.target_fast,
                             target_slow=t.target_slow,
                             crash_from_peak=t.crash_from_peak,
@@ -416,7 +443,6 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                         trades.append(runner)
                         new_open_trades.append(runner)
                     else:
-                        # Full exit at 10MA (original behavior)
                         t.exit_bar = i
                         t.exit_date = bar.date
                         t.exit_price = t.target_fast
@@ -425,8 +451,7 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                         t.bars_held = bars_held
                         if t.risk_pct > 0:
                             t.r_multiple = t.pnl_pct / t.risk_pct
-                # Check 20MA target
-                elif bar.high >= t.target_slow and t.target_slow > t.entry_price:
+                elif tgt_slow_hit:
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = t.target_slow
@@ -524,29 +549,54 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
         if is_climax_volume:
             last_climax_bar = i
 
+        # Selling climax: high volume + red candle (for washout detection)
+        is_selling_climax_bar = rvol >= cfg.selling_climax_rvol and bar.close < bar.open
+        if is_selling_climax_bar:
+            last_selling_climax_bar = i
+
         # Gate: climax must be within N bars of current bar
         climax_aligned = (i - last_climax_bar) <= cfg.climax_window_bars
         climax_vol_ok = climax_aligned if cfg.use_climax_vol else True
 
         # ═══════════════════════════════════════════════════════════
-        # WASHOUT CRASH DETECTION (Long Side)
+        # WASHOUT CRASH DETECTION (Long Side) — V2: Velocity + Selling Climax
         # ═══════════════════════════════════════════════════════════
         crash_from_peak = 0.0
+        crash_velocity = 0.0
         bars_from_peak = 0
         is_crash_candidate = False
         had_prior_run = True
+        peak_bar_idx = -1
 
         if enough_bars_peak:
-            # Find recent peak
+            # Find recent peak (use last/most-recent occurrence to match Pine's ta.highestbars)
             peak_window = highs[max(0, i - cfg.prior_run_lookback + 1):i + 1]
             peak_high = max(peak_window)
-            peak_offset = len(peak_window) - 1 - peak_window.index(peak_high)
+            # Reverse search: find last occurrence (most recent bar with this high)
+            last_idx = len(peak_window) - 1
+            for pi in range(last_idx, -1, -1):
+                if peak_window[pi] == peak_high:
+                    last_idx = pi
+                    break
+            peak_offset = len(peak_window) - 1 - last_idx
             peak_bar_idx = i - peak_offset
 
             bars_from_peak = i - peak_bar_idx
             crash_from_peak = ((peak_high - bar.close) / peak_high) * 100 if peak_high > 0 else 0.0
 
-            is_crash_candidate = crash_from_peak >= cfg.min_crash_pct and bars_from_peak <= cfg.crash_window
+            # V2: Velocity gate — crash must be fast enough (% per bar)
+            crash_velocity = crash_from_peak / max(bars_from_peak, 1)
+            is_velocity_crash = (crash_from_peak >= cfg.min_crash_pct
+                                 and crash_velocity >= cfg.crash_velocity_min
+                                 and bars_from_peak <= cfg.crash_window)
+
+            # V2: Selling climax gate — require capitulation volume during crash
+            has_selling_climax = True
+            if cfg.require_selling_climax:
+                # Check if any selling climax bar occurred between peak and now
+                has_selling_climax = last_selling_climax_bar >= peak_bar_idx
+
+            is_crash_candidate = is_velocity_crash and has_selling_climax
 
             # Prior run verification
             if cfg.require_prior_run and is_crash_candidate:
@@ -623,7 +673,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
 
             short_stop_width = abs(short_stop - bar.close) / bar.close * 100 if bar.close > 0 else 0.0
             short_adr_ok = True
-            if cfg.use_adr_filter and adr_pct > 0:
+            # ADR filter is redundant when ATR-based (ATR mult IS the risk control)
+            if cfg.use_adr_filter and adr_pct > 0 and cfg.short_stop_mode != "ATR Based":
                 short_adr_ok = short_stop_width <= (adr_pct * cfg.max_stop_vs_adr)
 
             if short_entry_proxy and short_close_ok and short_adr_ok:
@@ -722,7 +773,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
 
             long_stop_width = abs(bar.close - long_stop) / bar.close * 100 if bar.close > 0 else 0.0
             long_adr_ok = True
-            if cfg.use_adr_filter and adr_pct > 0:
+            # ADR filter is redundant when ATR-based (ATR mult IS the risk control)
+            if cfg.use_adr_filter and adr_pct > 0 and cfg.long_stop_mode != "ATR Based":
                 long_adr_ok = long_stop_width <= (adr_pct * cfg.max_stop_vs_adr)
 
             if long_entry_proxy and long_close_ok and long_adr_ok:
@@ -1009,6 +1061,142 @@ def print_grand_summary(all_trades: list):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# PARAMETER SWEEP
+# ═══════════════════════════════════════════════════════════════════
+
+def run_sweep(csv_files: list):
+    """Grid search across ATR mult, crash velocity, selling climax RVOL."""
+    from dataclasses import replace
+    import itertools
+
+    base_cfg = Config()
+
+    # Parameter grids
+    atr_mults = [1.0, 1.5, 2.0, 2.5, 3.0]
+    crash_velocities = [0.0, 3.0, 5.0, 7.0, 10.0]  # 0 = disabled (original behavior)
+    selling_climax_rvols = [0.0, 1.5, 2.0, 2.5, 3.0]  # 0 = disabled
+    directions = ["BOTH", "SHORT", "LONG"]
+
+    # Preload all bar data
+    ticker_bars = []
+    for csv_file in csv_files:
+        ticker = extract_ticker(csv_file)
+        bars = load_csv(csv_file)
+        ticker_bars.append((ticker, bars))
+
+    results = []
+    total_combos = len(atr_mults) * len(crash_velocities) * len(selling_climax_rvols) * len(directions)
+    combo_num = 0
+
+    print(f"\n  Running parameter sweep: {total_combos} combinations...")
+    print(f"  ATR mults: {atr_mults}")
+    print(f"  Crash velocities: {crash_velocities}")
+    print(f"  Selling climax RVOLs: {selling_climax_rvols}")
+    print(f"  Directions: {directions}\n")
+
+    header = (f"  {'#':>4} {'Dir':<6} {'ATR_M':>5} {'Vel':>5} {'SC_RV':>5} "
+              f"{'Setups':>6} {'S':>4} {'L':>4} {'WR%':>6} {'AvgPnL':>8} "
+              f"{'PF':>6} {'CumPnL':>9} {'AvgWin':>8} {'AvgLoss':>8} {'MaxDD':>7}")
+    print(header)
+    print(f"  {'-' * len(header)}")
+
+    for atr_m, vel, sc_rv, direction in itertools.product(atr_mults, crash_velocities, selling_climax_rvols, directions):
+        combo_num += 1
+        cfg = replace(base_cfg,
+                      atr_mult=atr_m,
+                      crash_velocity_min=vel if vel > 0 else 0.0,
+                      require_selling_climax=sc_rv > 0,
+                      selling_climax_rvol=sc_rv if sc_rv > 0 else 2.0,
+                      enable_short=direction in ("BOTH", "SHORT"),
+                      enable_long=direction in ("BOTH", "LONG"),
+                      )
+
+        all_trades = []
+        for ticker, bars in ticker_bars:
+            trades = run_backtest(ticker, bars, cfg)
+            all_trades.extend(trades)
+
+        closed = [t for t in all_trades if t.exit_reason not in ("OPEN_AT_END", "")]
+        if not closed:
+            continue
+
+        setups = [t for t in all_trades if not t.is_runner]
+        shorts_n = len([t for t in setups if t.direction == "SHORT"])
+        longs_n = len([t for t in setups if t.direction == "LONG"])
+
+        wins = [t for t in closed if t.pnl_pct > 0]
+        losses = [t for t in closed if t.pnl_pct <= 0]
+        total_weight = sum(t.weight for t in closed)
+        win_weight = sum(t.weight for t in wins)
+        wr = win_weight / total_weight * 100 if total_weight > 0 else 0
+        total_pnl = sum(t.pnl_pct * t.weight for t in closed)
+        avg_pnl = total_pnl / total_weight if total_weight > 0 else 0
+        gross_profit = sum(t.pnl_pct * t.weight for t in wins)
+        gross_loss = abs(sum(t.pnl_pct * t.weight for t in losses))
+        pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        avg_win = _weighted_avg(wins) if wins else 0
+        avg_loss = _weighted_avg(losses) if losses else 0
+
+        # Max drawdown
+        cumulative = 0.0
+        peak_cum = 0.0
+        max_dd = 0.0
+        for t in sorted(closed, key=lambda x: (x.exit_bar, -x.is_runner)):
+            cumulative += t.pnl_pct * t.weight
+            if cumulative > peak_cum:
+                peak_cum = cumulative
+            dd = peak_cum - cumulative
+            if dd > max_dd:
+                max_dd = dd
+
+        vel_str = f"{vel:.0f}" if vel > 0 else "off"
+        sc_str = f"{sc_rv:.1f}" if sc_rv > 0 else "off"
+
+        print(f"  {combo_num:>4} {direction:<6} {atr_m:>5.1f} {vel_str:>5} {sc_str:>5} "
+              f"{len(setups):>6} {shorts_n:>4} {longs_n:>4} {wr:>5.1f}% {avg_pnl:>+7.2f}% "
+              f"{pf:>5.2f} {total_pnl:>+8.1f}% {avg_win:>+7.2f}% {avg_loss:>+7.2f}% {max_dd:>6.1f}%")
+
+        results.append({
+            'direction': direction, 'atr_mult': atr_m,
+            'crash_velocity': vel, 'selling_climax_rvol': sc_rv,
+            'setups': len(setups), 'shorts': shorts_n, 'longs': longs_n,
+            'wr': wr, 'avg_pnl': avg_pnl, 'pf': pf,
+            'cum_pnl': total_pnl, 'avg_win': avg_win, 'avg_loss': avg_loss,
+            'max_dd': max_dd,
+        })
+
+    # Print top 20 by profit factor (min 10 setups)
+    viable = [r for r in results if r['setups'] >= 10]
+    top_pf = sorted(viable, key=lambda r: r['pf'], reverse=True)[:20]
+
+    print(f"\n  ═══ TOP 20 BY PROFIT FACTOR (min 10 setups) ═══")
+    print(f"  {'#':>3} {'Dir':<6} {'ATR_M':>5} {'Vel':>5} {'SC_RV':>5} "
+          f"{'Setups':>6} {'S':>4} {'L':>4} {'WR%':>6} {'AvgPnL':>8} "
+          f"{'PF':>6} {'CumPnL':>9} {'MaxDD':>7}")
+    for idx, r in enumerate(top_pf, 1):
+        vel_str = f"{r['crash_velocity']:.0f}" if r['crash_velocity'] > 0 else "off"
+        sc_str = f"{r['selling_climax_rvol']:.1f}" if r['selling_climax_rvol'] > 0 else "off"
+        print(f"  {idx:>3} {r['direction']:<6} {r['atr_mult']:>5.1f} {vel_str:>5} {sc_str:>5} "
+              f"{r['setups']:>6} {r['shorts']:>4} {r['longs']:>4} {r['wr']:>5.1f}% {r['avg_pnl']:>+7.2f}% "
+              f"{r['pf']:>5.2f} {r['cum_pnl']:>+8.1f}% {r['max_dd']:>6.1f}%")
+
+    # Top 20 by avg PnL
+    top_avg = sorted(viable, key=lambda r: r['avg_pnl'], reverse=True)[:20]
+    print(f"\n  ═══ TOP 20 BY AVG PNL (min 10 setups) ═══")
+    print(f"  {'#':>3} {'Dir':<6} {'ATR_M':>5} {'Vel':>5} {'SC_RV':>5} "
+          f"{'Setups':>6} {'S':>4} {'L':>4} {'WR%':>6} {'AvgPnL':>8} "
+          f"{'PF':>6} {'CumPnL':>9} {'MaxDD':>7}")
+    for idx, r in enumerate(top_avg, 1):
+        vel_str = f"{r['crash_velocity']:.0f}" if r['crash_velocity'] > 0 else "off"
+        sc_str = f"{r['selling_climax_rvol']:.1f}" if r['selling_climax_rvol'] > 0 else "off"
+        print(f"  {idx:>3} {r['direction']:<6} {r['atr_mult']:>5.1f} {vel_str:>5} {sc_str:>5} "
+              f"{r['setups']:>6} {r['shorts']:>4} {r['longs']:>4} {r['wr']:>5.1f}% {r['avg_pnl']:>+7.2f}% "
+              f"{r['pf']:>5.2f} {r['cum_pnl']:>+8.1f}% {r['max_dd']:>6.1f}%")
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1017,6 +1205,11 @@ def main():
     parser.add_argument(
         "--data-dir",
         help="Directory containing OHLC CSV files (defaults to auto-discovery)",
+    )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Run parameter sweep instead of single backtest",
     )
     args = parser.parse_args()
 
@@ -1041,6 +1234,10 @@ def main():
         print(f"ERROR: No CSV files found in {data_dir}")
         sys.exit(1)
 
+    if args.sweep:
+        run_sweep(csv_files)
+        return
+
     cfg = Config()
 
     print("=" * 100)
@@ -1058,6 +1255,8 @@ def main():
     print(f"    Min Ext Above MA:    {cfg.min_ext_above_ma}%")
     print(f"    Min Crash %:         {cfg.min_crash_pct}%")
     print(f"    Crash Window:        {cfg.crash_window} bars")
+    print(f"    Crash Velocity Min:  {cfg.crash_velocity_min}%/bar")
+    print(f"    Selling Climax Gate: {cfg.require_selling_climax} (RVOL >= {cfg.selling_climax_rvol}x)")
     print(f"    Require Prior Run:   {cfg.require_prior_run} (min {cfg.prior_run_min_pct}%)")
     print(f"    Short Trigger:       {cfg.short_trigger}")
     print(f"    Long Trigger:        {cfg.long_trigger}")
