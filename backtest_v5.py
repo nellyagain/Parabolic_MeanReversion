@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Config:
-    # ── SHORT side (unchanged from V4) ──
+    # ── SHORT side ──
     enable_short: bool = True
     largecap_gain_pct: float = 40.0
     smallcap_gain_pct: float = 300.0
@@ -42,10 +42,18 @@ class Config:
     manual_gain_pct: float = 80.0
     gain_lookback: int = 20
     min_green_days: int = 3
-    min_ext_above_ma: float = 20.0
+    min_ext_above_ma: float = 30.0     # V7: was 20.0; raise to only short extreme extensions
     ext_ma_len: int = 20
     use_ext_bb_filter: bool = False
     bb_dev_mult: float = 3.0
+    # SHORT exit: no runner — take full profit at 10MA (runner survival collapsed to 0%)
+    short_split_exit: bool = False    # V6: disabled (was True in V4/V5)
+    short_split_pct: float = 50.0
+    short_time_stop: int = 20        # V7: was 15; give SHORT winners more room (TIME_STOP avg +11%)
+    # SHORT regime filter: rolling circuit breaker
+    short_circuit_breaker: bool = True    # V6: pause shorts if recent performance is bad
+    short_circuit_lookback: int = 5       # V7: was 10; faster response to losing streaks
+    short_circuit_min_wr: float = 40.0    # V7: was 25%; more aggressive circuit breaker
 
     # ── LONG side — Crash Detection (kept from V4) ──
     enable_long: bool = True
@@ -58,33 +66,37 @@ class Config:
     prior_run_min_pct: float = 40.0
     prior_run_lookback: int = 60
 
-    # ── LONG side — V5 Hybrid Base Detection ──
-    min_base_bars: int = 7           # Minimum bars in base before breakout allowed
-    atr_contraction_pct: float = 80.0  # ATR must contract to this % of crash ATR
-    absorption_threshold: float = 0.2  # Min absorption score (0-1 scale)
+    # ── LONG side — V6 Dual-Channel Entry ──
+    # Channel A: Fast path (V4-style) for deep crashes — enter on First Green Day
+    long_fast_path: bool = True           # V6: enabled
+    fast_path_min_crash: float = 30.0     # V7: was 35%; all crashes ≥30% use fast path FGD entry
+    fast_path_trigger: str = "First Green Day"
+    # Channel B: Wyckoff base breakout for shallower crashes
+    min_base_bars: int = 7
+    atr_contraction_pct: float = 80.0
+    absorption_threshold: float = 0.2
     # Spring detection (optional, additive)
-    spring_atr_mult: float = 1.0     # Spring depth = this * ATR
-    spring_depth_floor_pct: float = 1.5  # Min spring depth as % of price
-    spring_depth_cap_pct: float = 5.0    # Max spring depth as % of price
-    spring_max_recovery_bars: int = 3    # Must recover within N bars
-    spring_score_bonus: float = 0.25     # Bonus to absorption score if spring detected
+    spring_atr_mult: float = 1.0
+    spring_depth_floor_pct: float = 1.5
+    spring_depth_cap_pct: float = 5.0
+    spring_max_recovery_bars: int = 3
+    spring_score_bonus: float = 0.25
     # Breakout trigger
-    breakout_rvol_min: float = 1.2   # Volume must be >= 1.2x median
-    breakout_close_strength: float = 0.6  # Close in upper 40% of bar
-    breakout_range_expansion: float = 1.0  # True range >= median TR (no expansion required)
-    # Regime filter
-    use_regime_filter: bool = False   # Off by default — too strict for crash-bounce setups
-    regime_ma_len: int = 200
+    breakout_rvol_min: float = 1.2
+    breakout_close_strength: float = 0.6
+    breakout_range_expansion: float = 1.0
     # Gap exclusion
-    gap_exclusion_atr_mult: float = 2.0  # Exclude if gap > 2*ATR
+    gap_exclusion_atr_mult: float = 2.0
 
-    # ── LONG side — V5 Exit Model ──
+    # ── LONG side — Stop Management ──
+    long_stop_cap_atr_mult: float = 2.0   # V6: cap structural stop at 2x ATR from entry
+    # ── LONG side — Exit Model ──
     long_exit_mode: str = "v5_hybrid"  # "v5_hybrid" or "v4_legacy"
-    long_r1_target: float = 1.5      # First partial at 1.5R
-    long_r2_target: float = 2.5      # Second partial at 2.5R
-    long_partial_pct: float = 33.3   # % to close at each R target
-    long_trail_channel: int = 10     # Trailing stop: lowest low of N bars
-    long_time_stop: int = 30         # Exit if no target hit within N bars
+    long_r1_target: float = 1.5
+    long_r2_target: float = 2.5
+    long_partial_pct: float = 33.3
+    long_trail_channel: int = 10
+    long_time_stop: int = 30
 
     # ── Climax Volume (SHORT side) ──
     use_climax_vol: bool = False
@@ -98,42 +110,49 @@ class Config:
     min_avg_dollar_vol: float = 0.0
     dollar_vol_len: int = 20
 
-    # ── Setup Trigger (SHORT only in V5) ──
+    # ── Setup Trigger (SHORT only) ──
     short_trigger: str = "Close < Prior Low"
     min_bars_after_setup: int = 0
 
-    # ── Targets (SHORT side, V4 legacy for LONG if v4 mode) ──
+    # ── Targets (SHORT side MA exits, LONG side legacy) ──
     target_ma_fast: int = 10
     target_ma_slow: int = 20
+
+    # ── Regime Filter ──
+    use_regime_filter: bool = False   # V6: kept disabled (blocks crash-bounce setups below 200MA)
+    regime_ma_len: int = 200
 
     # ── Trend Context ──
     use_trend_filter: bool = False
     trend_ma_len: int = 50
 
-    # ── Split Exit (SHORT side) ──
-    split_exit: bool = True
+    # ── Split Exit — legacy compat (now controlled by short_split_exit) ──
+    split_exit: bool = False       # V6: global off; SHORT uses short_split_exit
     split_pct: float = 50.0
 
     # ── Quality Gates ──
     min_close_strength: float = 0.0
     use_adr_filter: bool = True
     adr_len: int = 20
-    max_stop_vs_adr: float = 1.5
+    max_stop_vs_adr: float = 1.2      # V7: was 1.5; tighter stops to improve SHORT win/loss ratio
 
     # ── Risk Management ──
     short_stop_mode: str = "Run Peak"
-    long_stop_mode: str = "Structural"  # V5: structural (base_low or spring_low)
+    long_stop_mode: str = "Structural"  # V6: structural with ATR cap
     stop_buffer: float = 0.2
     atr_len: int = 14
     atr_mult: float = 1.0
 
     # ── Timeouts & Cooldown ──
     short_setup_timeout: int = 10
-    long_base_timeout: int = 80      # V5: longer timeout for base formation (was 10)
+    long_setup_timeout: int = 10     # V6: fast-path timeout (same as V4)
+    long_base_timeout: int = 80      # V6: base-path timeout
     cooldown_bars: int = 3
 
     # ── Backtest-specific ──
     max_trade_bars: int = 50
+    # ── Forward test ──
+    forward_test_date: str = "2023-01-01"  # V6: fixed calendar cutoff for all tickers
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -379,7 +398,7 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
     daily_range_pcts = []
     true_ranges = []
 
-    # SHORT state machine (unchanged from V4)
+    # SHORT state machine
     short_setup_active = False
     short_setup_bar = -1
     parabolic_peak = 0.0
@@ -390,8 +409,16 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
     short_avwap_num = 0.0
     short_avwap_den = 0.0
     short_run_avwap = 0.0
+    # V6: SHORT circuit breaker — track recent SHORT trade results
+    recent_short_results = []  # list of pnl_pct for last N SHORT trades
+    short_circuit_active = False  # True when circuit breaker is tripped
 
-    # LONG state machine — V5 hybrid phases
+    # LONG state machine — V6 dual-channel (fast path + base breakout)
+    # Fast path state (Channel A)
+    long_fast_active = False
+    long_fast_bar = -1
+    long_fast_washout_low = 0.0
+    long_fast_crash_pct = 0.0
     # Phase 1: Crash detected (sets long_crash_detected)
     # Phase 2: AR forming (tracking highest high after crash)
     # Phase 3: Base building (monitoring absorption)
@@ -454,10 +481,10 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 continue
 
             if t.direction == "SHORT":
-                # SHORT exit logic (unchanged from V4)
+                # V6 SHORT exit: no runner, full exit at 10MA, SHORT-specific time stop
                 stop_hit = bar.high >= t.stop_price
                 tgt_fast_hit = not t.is_runner and bar.low <= t.target_fast and t.target_fast < t.entry_price
-                tgt_slow_hit = bar.low <= t.target_slow and t.target_slow < t.entry_price
+                tgt_slow_hit = t.is_runner and bar.low <= t.target_slow and t.target_slow < t.entry_price
 
                 if stop_hit and (tgt_fast_hit or tgt_slow_hit):
                     dist_to_stop = abs(t.stop_price - bar.open)
@@ -478,43 +505,21 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     t.bars_held = bars_held
                     if t.risk_pct > 0:
                         t.r_multiple = t.pnl_pct / t.risk_pct
+                    if not t.is_runner:
+                        recent_short_results.append(t.pnl_pct)
                 elif tgt_fast_hit:
-                    if cfg.split_exit:
-                        t.exit_bar = i
-                        t.exit_date = bar.date
-                        t.exit_price = t.target_fast
-                        t.exit_reason = "TARGET_10MA_PARTIAL"
-                        t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
-                        t.bars_held = bars_held
-                        t.weight = cfg.split_pct / 100.0
-                        if t.risk_pct > 0:
-                            t.r_multiple = t.pnl_pct / t.risk_pct
-                        runner = Trade(
-                            ticker=t.ticker, direction="SHORT",
-                            entry_bar=t.entry_bar, entry_date=t.entry_date,
-                            entry_price=t.entry_price,
-                            stop_price=t.entry_price,
-                            target_fast=t.target_fast,
-                            target_slow=t.target_slow,
-                            extension_pct=t.extension_pct,
-                            rolling_gain_pct=t.rolling_gain_pct,
-                            green_streak=t.green_streak,
-                            risk_pct=t.risk_pct,
-                            weight=1.0 - cfg.split_pct / 100.0,
-                            is_runner=True,
-                        )
-                        trades.append(runner)
-                        new_open_trades.append(runner)
-                    else:
-                        t.exit_bar = i
-                        t.exit_date = bar.date
-                        t.exit_price = t.target_fast
-                        t.exit_reason = "TARGET_10MA"
-                        t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
-                        t.bars_held = bars_held
-                        if t.risk_pct > 0:
-                            t.r_multiple = t.pnl_pct / t.risk_pct
+                    # V6: full exit at 10MA (no runner — runner survival collapsed)
+                    t.exit_bar = i
+                    t.exit_date = bar.date
+                    t.exit_price = t.target_fast
+                    t.exit_reason = "TARGET_10MA"
+                    t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
+                    t.bars_held = bars_held
+                    if t.risk_pct > 0:
+                        t.r_multiple = t.pnl_pct / t.risk_pct
+                    recent_short_results.append(t.pnl_pct)
                 elif tgt_slow_hit:
+                    # Runner leg hits 20MA
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = t.target_slow
@@ -523,15 +528,18 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     t.bars_held = bars_held
                     if t.risk_pct > 0:
                         t.r_multiple = t.pnl_pct / t.risk_pct
-                elif bars_held >= cfg.max_trade_bars:
+                elif bars_held >= cfg.short_time_stop:
+                    # V6: SHORT-specific time stop (15 bars, was 50)
                     t.exit_bar = i
                     t.exit_date = bar.date
                     t.exit_price = bar.close
-                    t.exit_reason = "TIMEOUT"
+                    t.exit_reason = "TIME_STOP"
                     t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
                     t.bars_held = bars_held
                     if t.risk_pct > 0:
                         t.r_multiple = t.pnl_pct / t.risk_pct
+                    if not t.is_runner:
+                        recent_short_results.append(t.pnl_pct)
                 else:
                     new_open_trades.append(t)
                     continue
@@ -929,7 +937,15 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
             if cfg.use_adr_filter and adr_pct > 0 and cfg.short_stop_mode != "ATR Based":
                 short_adr_ok = short_stop_width <= (adr_pct * cfg.max_stop_vs_adr)
 
-            if short_entry_proxy and short_close_ok and short_adr_ok:
+            # V6: circuit breaker — skip SHORT if trailing performance is bad
+            circuit_ok = True
+            if cfg.short_circuit_breaker and len(recent_short_results) >= cfg.short_circuit_lookback:
+                trailing = recent_short_results[-cfg.short_circuit_lookback:]
+                trailing_wr = sum(1 for p in trailing if p > 0) / len(trailing) * 100
+                if trailing_wr < cfg.short_circuit_min_wr:
+                    circuit_ok = False
+
+            if short_entry_proxy and short_close_ok and short_adr_ok and circuit_ok:
                 short_setup_triggered = True
                 tf = sma(closes, cfg.target_ma_fast)
                 ts_val = sma(closes, cfg.target_ma_slow)
@@ -961,11 +977,76 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
             short_run_avwap = 0.0
 
         # ═══════════════════════════════════════════════════════════
-        # LONG SETUP STATE MACHINE — V5 HYBRID (Wyckoff + CAN SLIM)
+        # LONG SETUP — V6 DUAL-CHANNEL
+        # Channel A: Fast path for deep crashes (First Green Day)
+        # Channel B: Wyckoff base breakout for shallower crashes
         # ═══════════════════════════════════════════════════════════
 
-        # PHASE 1: Crash Detection → Start AR Tracking
+        # ── CHANNEL A: Fast Path (V4-style) ──
+        # Activate on deep crash detection
+        if (cfg.enable_long and cfg.long_fast_path and washout_detected
+                and crash_from_peak >= cfg.fast_path_min_crash
+                and not long_fast_active and long_phase == LONG_IDLE
+                and (i - last_long_bar > cfg.cooldown_bars)):
+            long_fast_active = True
+            long_fast_bar = i
+            long_fast_washout_low = bar.low
+            long_fast_crash_pct = crash_from_peak
+
+        # Track washout low during fast-path active
+        if long_fast_active and bar.low < long_fast_washout_low:
+            long_fast_washout_low = bar.low
+
+        # Fast path trigger: First Green Day
+        if long_fast_active and (i - long_fast_bar) >= cfg.min_bars_after_setup:
+            fast_trigger = False
+            if cfg.fast_path_trigger == "First Green Day":
+                fast_trigger = bar.close > bar.open and i > 0 and bar.close > bars[i - 1].close
+
+            if fast_trigger:
+                # ATR-based stop with cap
+                current_atr = atr_calc(bars[:i + 1], cfg.atr_len)
+                long_stop = bar.close - (current_atr * cfg.atr_mult)
+                # Also consider washout low
+                struct_stop = long_fast_washout_low * (1 - cfg.stop_buffer / 100)
+                # Use the tighter of: ATR stop, washout low, or 2*ATR cap
+                atr_cap = bar.close - (current_atr * cfg.long_stop_cap_atr_mult)
+                long_stop = max(long_stop, struct_stop, atr_cap)
+
+                risk_pct = ((bar.close - long_stop) / bar.close) * 100 if bar.close > 0 else 0.0
+                r_unit = bar.close - long_stop
+
+                target_r1 = bar.close + (r_unit * cfg.long_r1_target) if r_unit > 0 else 0.0
+                target_r2 = bar.close + (r_unit * cfg.long_r2_target) if r_unit > 0 else 0.0
+                tf = sma(closes, cfg.target_ma_fast)
+                ts_val = sma(closes, cfg.target_ma_slow)
+
+                trade = Trade(
+                    ticker=ticker, direction="LONG",
+                    entry_bar=i, entry_date=bar.date,
+                    entry_price=bar.close, stop_price=long_stop,
+                    target_fast=tf, target_slow=ts_val,
+                    crash_from_peak=long_fast_crash_pct,
+                    risk_pct=risk_pct,
+                    base_duration=i - long_fast_bar,
+                    r_unit=r_unit,
+                    target_r1_price=target_r1,
+                    target_r2_price=target_r2,
+                )
+                trades.append(trade)
+                open_trades.append(trade)
+
+                long_fast_active = False
+                last_long_bar = i
+
+        # Fast path timeout
+        if long_fast_active and (i - long_fast_bar > cfg.long_setup_timeout):
+            long_fast_active = False
+
+        # ── CHANNEL B: Wyckoff Base Breakout ──
+        # Activate on crash detection (only if fast path didn't already take it)
         if (cfg.enable_long and washout_detected and long_phase == LONG_IDLE
+                and not long_fast_active
                 and (i - last_long_bar > cfg.cooldown_bars)):
             long_phase = LONG_AR_FORMING
             long_phase_bar = i
@@ -1158,14 +1239,17 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     and range_expanded and regime_ok and gap_ok
                     and abs_score >= cfg.absorption_threshold):
 
-                # Structural stop
+                # Structural stop with ATR cap (V6)
                 if long_spring_detected and long_spring_low > 0:
                     long_stop = long_spring_low * (1 - cfg.stop_buffer / 100)
                 else:
                     long_stop = long_base_low * (1 - cfg.stop_buffer / 100)
+                # V6: cap structural stop at 2x ATR from entry
+                atr_cap_stop = bar.close - (atr_now * cfg.long_stop_cap_atr_mult)
+                long_stop = max(long_stop, atr_cap_stop)
 
                 risk_pct = ((bar.close - long_stop) / bar.close) * 100 if bar.close > 0 else 0.0
-                r_unit = bar.close - long_stop  # Dollar value of 1R
+                r_unit = bar.close - long_stop
 
                 # R-based targets
                 target_r1 = bar.close + (r_unit * cfg.long_r1_target) if r_unit > 0 else 0.0
@@ -1648,12 +1732,14 @@ def main():
         cfg.enable_short = False
 
     if args.forward_test:
-        # Split data 70/30 for each ticker
+        # V6: fixed calendar date cutoff for all tickers (not per-ticker 70/30)
+        cutoff_date = cfg.forward_test_date
         print("=" * 100)
-        print("  V5 HYBRID — FORWARD TEST (70% in-sample / 30% out-of-sample)")
+        print(f"  V6 HYBRID — FORWARD TEST (IS: before {cutoff_date} / OOS: {cutoff_date}+)")
         print("=" * 100)
         print(f"\n  Data directory: {data_dir}")
         print(f"  Tickers found:  {len(csv_files)}")
+        print(f"  Cutoff date:    {cutoff_date}")
 
         is_trades = []
         oos_trades = []
@@ -1664,20 +1750,18 @@ def main():
             if len(bars_data) < 200:
                 continue
 
-            split_idx = int(len(bars_data) * 0.7)
-            # Need to run on full data but only count trades by entry_bar
             all_t = run_backtest(ticker, bars_data, cfg)
             for t in all_t:
-                if t.entry_bar < split_idx:
+                if t.entry_date < cutoff_date:
                     is_trades.append(t)
                 else:
                     oos_trades.append(t)
 
-        print(f"\n  ═══ IN-SAMPLE (first 70%) ═══")
-        print_grand_summary(is_trades, label="V5 HYBRID — IN-SAMPLE")
+        print(f"\n  ═══ IN-SAMPLE (before {cutoff_date}) ═══")
+        print_grand_summary(is_trades, label=f"V6 HYBRID — IS (before {cutoff_date})")
 
-        print(f"\n  ═══ OUT-OF-SAMPLE (last 30%) ═══")
-        print_grand_summary(oos_trades, label="V5 HYBRID — OUT-OF-SAMPLE")
+        print(f"\n  ═══ OUT-OF-SAMPLE ({cutoff_date}+) ═══")
+        print_grand_summary(oos_trades, label=f"V6 HYBRID — OOS ({cutoff_date}+)")
         return
 
     if args.walk_forward:
@@ -1690,25 +1774,22 @@ def main():
     print("=" * 100)
     print(f"\n  Data directory: {data_dir}")
     print(f"  Tickers found:  {len(csv_files)}")
-    print(f"\n  V5 Configuration:")
+    print(f"\n  V6 Configuration:")
+    print(f"    ── SHORT ──")
     print(f"    Short Enabled:         {cfg.enable_short}")
+    print(f"    Short Split Exit:      {cfg.short_split_exit} (V6: runner killed)")
+    print(f"    Short Time Stop:       {cfg.short_time_stop} bars (V6: was 50)")
+    print(f"    Circuit Breaker:       {cfg.short_circuit_breaker} (trailing {cfg.short_circuit_lookback} trades, min WR {cfg.short_circuit_min_wr}%)")
+    print(f"    ── LONG ──")
     print(f"    Long Enabled:          {cfg.enable_long}")
+    print(f"    Long Fast Path:        {cfg.long_fast_path} (>= {cfg.fast_path_min_crash}% crash → FGD)")
+    print(f"    Long Base Path:        min {cfg.min_base_bars} bars, abs >= {cfg.absorption_threshold}")
+    print(f"    Stop Cap:              {cfg.long_stop_cap_atr_mult}x ATR")
     print(f"    Long Exit Mode:        {cfg.long_exit_mode}")
-    print(f"    Long Stop Mode:        {cfg.long_stop_mode}")
-    print(f"    Min Base Duration:     {cfg.min_base_bars} bars")
-    print(f"    ATR Contraction:       {cfg.atr_contraction_pct}%")
-    print(f"    Absorption Threshold:  {cfg.absorption_threshold}")
-    print(f"    Spring Score Bonus:    {cfg.spring_score_bonus}")
-    print(f"    Breakout RVOL (med):   {cfg.breakout_rvol_min}x")
-    print(f"    Breakout Close Str:    {cfg.breakout_close_strength}")
-    print(f"    Range Expansion:       {cfg.breakout_range_expansion}x")
-    print(f"    Regime Filter:         {cfg.use_regime_filter} ({cfg.regime_ma_len}-bar MA)")
-    print(f"    Gap Exclusion:         {cfg.gap_exclusion_atr_mult}x ATR")
-    print(f"    R1 Target:             {cfg.long_r1_target}R")
-    print(f"    R2 Target:             {cfg.long_r2_target}R")
-    print(f"    Time Stop:             {cfg.long_time_stop} bars")
+    print(f"    R1/R2 Targets:         {cfg.long_r1_target}R / {cfg.long_r2_target}R")
+    print(f"    Long Time Stop:        {cfg.long_time_stop} bars")
     print(f"    Trail Channel:         {cfg.long_trail_channel} bars")
-    print(f"    Base Timeout:          {cfg.long_base_timeout} bars")
+    print(f"    Forward Test Date:     {cfg.forward_test_date}")
 
     print(f"\n  ── Per-Ticker Results ──")
     print(f"  {'Ticker':<8} | {'Total':>6} | {'Short':>6} | {'Long':>6} | {'Legs':>7} | {'Win%':>7} | "
