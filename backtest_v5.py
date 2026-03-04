@@ -88,8 +88,12 @@ class Config:
     # Gap exclusion
     gap_exclusion_atr_mult: float = 2.0
 
+    # ── V8: SHORT minimum reward filter ──
+    short_min_reward_pct: float = 0.0     # V8: disabled (entry filters reduce sample too much)
+
     # ── LONG side — Stop Management ──
     long_stop_cap_atr_mult: float = 2.0   # V6: cap structural stop at 2x ATR from entry
+    long_max_stop_pct: float = 0.0        # V8: disabled (tighter stops create more stop-outs)
     # ── LONG side — Exit Model ──
     long_exit_mode: str = "v5_hybrid"  # "v5_hybrid" or "v4_legacy"
     long_r1_target: float = 1.5
@@ -142,6 +146,11 @@ class Config:
     stop_buffer: float = 0.2
     atr_len: int = 14
     atr_mult: float = 1.0
+    max_loss_pct: float = 0.0            # V8: disabled (conflicts with stop logic, causes worse fills)
+
+    # ── V8: Per-ticker LONG cooldown ──
+    long_ticker_cooldown: bool = True     # V8: skip LONG on a ticker after N consecutive stops
+    long_ticker_max_consec_stops: int = 3 # V8: number of consecutive LONG stops before cooldown
 
     # ── Timeouts & Cooldown ──
     short_setup_timeout: int = 10
@@ -153,6 +162,8 @@ class Config:
     max_trade_bars: int = 50
     # ── Forward test ──
     forward_test_date: str = "2023-01-01"  # V6: fixed calendar cutoff for all tickers
+    # ── V8: Additional data directories ──
+    extra_data_dirs: list = None  # V8: list of additional data directories to scan
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -412,6 +423,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
     # V6: SHORT circuit breaker — track recent SHORT trade results
     recent_short_results = []  # list of pnl_pct for last N SHORT trades
     short_circuit_active = False  # True when circuit breaker is tripped
+    # V8: Per-ticker LONG consecutive stop tracker
+    long_ticker_consec_stops = {}  # ticker -> count of consecutive LONG stops
 
     # LONG state machine — V6 dual-channel (fast path + base breakout)
     # Fast path state (Channel A)
@@ -481,6 +494,21 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 continue
 
             if t.direction == "SHORT":
+                # V8: Hard max loss cap — force exit if unrealized loss exceeds max_loss_pct
+                unrealized_short_pnl = ((t.entry_price - bar.close) / t.entry_price) * 100 if t.entry_price > 0 else 0
+                if cfg.max_loss_pct > 0 and unrealized_short_pnl < -cfg.max_loss_pct:
+                    t.exit_bar = i
+                    t.exit_date = bar.date
+                    t.exit_price = bar.close
+                    t.exit_reason = "MAX_LOSS"
+                    t.pnl_pct = unrealized_short_pnl
+                    t.bars_held = bars_held
+                    if t.risk_pct > 0:
+                        t.r_multiple = t.pnl_pct / t.risk_pct
+                    if not t.is_runner:
+                        recent_short_results.append(t.pnl_pct)
+                    continue
+
                 # V6 SHORT exit: no runner, full exit at 10MA, SHORT-specific time stop
                 stop_hit = bar.high >= t.stop_price
                 tgt_fast_hit = not t.is_runner and bar.low <= t.target_fast and t.target_fast < t.entry_price
@@ -545,6 +573,22 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     continue
 
             elif t.direction == "LONG":
+                # V8: Hard max loss cap for LONG trades
+                unrealized_long_pnl = ((bar.close - t.entry_price) / t.entry_price) * 100 if t.entry_price > 0 else 0
+                if cfg.max_loss_pct > 0 and unrealized_long_pnl < -cfg.max_loss_pct and t.partial_stage < 1:
+                    t.exit_bar = i
+                    t.exit_date = bar.date
+                    t.exit_price = bar.close
+                    t.exit_reason = "MAX_LOSS"
+                    t.pnl_pct = unrealized_long_pnl
+                    t.bars_held = bars_held
+                    if t.risk_pct > 0:
+                        t.r_multiple = t.pnl_pct / t.risk_pct
+                    # V8: Track consecutive LONG stops per ticker
+                    if not t.is_runner:
+                        long_ticker_consec_stops[ticker] = long_ticker_consec_stops.get(ticker, 0) + 1
+                    continue
+
                 # V5 LONG exit logic
                 if cfg.long_exit_mode == "v5_hybrid" and t.r_unit > 0:
                     # Update trailing stop
@@ -584,6 +628,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                             t.exit_reason = "STOP_BREAKEVEN"
                         else:
                             t.exit_reason = "STOP"
+                            # V8: Track consecutive LONG stops per ticker
+                            long_ticker_consec_stops[ticker] = long_ticker_consec_stops.get(ticker, 0) + 1
                         t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
                         t.bars_held = bars_held
                         if t.risk_pct > 0:
@@ -599,6 +645,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                         t.weight = cfg.long_partial_pct / 100.0
                         if t.risk_pct > 0:
                             t.r_multiple = t.pnl_pct / t.risk_pct
+                        # V8: Reset consecutive stop counter — trade won
+                        long_ticker_consec_stops[ticker] = 0
                         # Create runner for R2
                         runner = Trade(
                             ticker=t.ticker, direction="LONG",
@@ -951,24 +999,30 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 ts_val = sma(closes, cfg.target_ma_slow)
                 risk_pct = ((short_stop - bar.close) / bar.close) * 100 if bar.close > 0 else 0.0
 
-                trade = Trade(
-                    ticker=ticker, direction="SHORT",
-                    entry_bar=i, entry_date=bar.date,
-                    entry_price=bar.close, stop_price=short_stop,
-                    target_fast=tf, target_slow=ts_val,
-                    extension_pct=extension_pct,
-                    rolling_gain_pct=rolling_gain_pct,
-                    green_streak=green_streak,
-                    risk_pct=risk_pct,
-                )
-                trades.append(trade)
-                open_trades.append(trade)
+                # V8: SHORT minimum reward filter — 10MA target must be >= N% below entry
+                short_reward_pct = ((bar.close - tf) / bar.close) * 100 if bar.close > 0 and tf < bar.close else 0.0
+                if short_reward_pct < cfg.short_min_reward_pct:
+                    short_setup_triggered = False
 
-                short_setup_active = False
-                last_short_bar = i
-                short_avwap_num = 0.0
-                short_avwap_den = 0.0
-                short_run_avwap = 0.0
+                if short_setup_triggered:
+                    trade = Trade(
+                        ticker=ticker, direction="SHORT",
+                        entry_bar=i, entry_date=bar.date,
+                        entry_price=bar.close, stop_price=short_stop,
+                        target_fast=tf, target_slow=ts_val,
+                        extension_pct=extension_pct,
+                        rolling_gain_pct=rolling_gain_pct,
+                        green_streak=green_streak,
+                        risk_pct=risk_pct,
+                    )
+                    trades.append(trade)
+                    open_trades.append(trade)
+
+                    short_setup_active = False
+                    last_short_bar = i
+                    short_avwap_num = 0.0
+                    short_avwap_den = 0.0
+                    short_run_avwap = 0.0
 
         if short_setup_active and (i - short_setup_bar > cfg.short_setup_timeout):
             short_setup_active = False
@@ -1014,30 +1068,46 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 long_stop = max(long_stop, struct_stop, atr_cap)
 
                 risk_pct = ((bar.close - long_stop) / bar.close) * 100 if bar.close > 0 else 0.0
-                r_unit = bar.close - long_stop
 
-                target_r1 = bar.close + (r_unit * cfg.long_r1_target) if r_unit > 0 else 0.0
-                target_r2 = bar.close + (r_unit * cfg.long_r2_target) if r_unit > 0 else 0.0
-                tf = sma(closes, cfg.target_ma_fast)
-                ts_val = sma(closes, cfg.target_ma_slow)
+                # V8: Hard-cap LONG stop at max_loss_pct from entry
+                if cfg.long_max_stop_pct > 0 and risk_pct > cfg.long_max_stop_pct and bar.close > 0:
+                    long_stop = bar.close * (1 - cfg.long_max_stop_pct / 100.0)
+                    risk_pct = cfg.long_max_stop_pct
 
-                trade = Trade(
-                    ticker=ticker, direction="LONG",
-                    entry_bar=i, entry_date=bar.date,
-                    entry_price=bar.close, stop_price=long_stop,
-                    target_fast=tf, target_slow=ts_val,
-                    crash_from_peak=long_fast_crash_pct,
-                    risk_pct=risk_pct,
-                    base_duration=i - long_fast_bar,
-                    r_unit=r_unit,
-                    target_r1_price=target_r1,
-                    target_r2_price=target_r2,
-                )
-                trades.append(trade)
-                open_trades.append(trade)
+                # V8: Per-ticker LONG cooldown check
+                ticker_cooldown_ok = True
+                if cfg.long_ticker_cooldown:
+                    consec = long_ticker_consec_stops.get(ticker, 0)
+                    if consec >= cfg.long_ticker_max_consec_stops:
+                        ticker_cooldown_ok = False
 
-                long_fast_active = False
-                last_long_bar = i
+                if not ticker_cooldown_ok:
+                    long_fast_active = False
+                else:
+                    r_unit = bar.close - long_stop
+
+                    target_r1 = bar.close + (r_unit * cfg.long_r1_target) if r_unit > 0 else 0.0
+                    target_r2 = bar.close + (r_unit * cfg.long_r2_target) if r_unit > 0 else 0.0
+                    tf = sma(closes, cfg.target_ma_fast)
+                    ts_val = sma(closes, cfg.target_ma_slow)
+
+                    trade = Trade(
+                        ticker=ticker, direction="LONG",
+                        entry_bar=i, entry_date=bar.date,
+                        entry_price=bar.close, stop_price=long_stop,
+                        target_fast=tf, target_slow=ts_val,
+                        crash_from_peak=long_fast_crash_pct,
+                        risk_pct=risk_pct,
+                        base_duration=i - long_fast_bar,
+                        r_unit=r_unit,
+                        target_r1_price=target_r1,
+                        target_r2_price=target_r2,
+                    )
+                    trades.append(trade)
+                    open_trades.append(trade)
+
+                    long_fast_active = False
+                    last_long_bar = i
 
         # Fast path timeout
         if long_fast_active and (i - long_fast_bar > cfg.long_setup_timeout):
@@ -1249,40 +1319,56 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 long_stop = max(long_stop, atr_cap_stop)
 
                 risk_pct = ((bar.close - long_stop) / bar.close) * 100 if bar.close > 0 else 0.0
-                r_unit = bar.close - long_stop
 
-                # R-based targets
-                target_r1 = bar.close + (r_unit * cfg.long_r1_target) if r_unit > 0 else 0.0
-                target_r2 = bar.close + (r_unit * cfg.long_r2_target) if r_unit > 0 else 0.0
+                # V8: Hard-cap LONG stop at max_loss_pct from entry
+                if cfg.long_max_stop_pct > 0 and risk_pct > cfg.long_max_stop_pct and bar.close > 0:
+                    long_stop = bar.close * (1 - cfg.long_max_stop_pct / 100.0)
+                    risk_pct = cfg.long_max_stop_pct
 
-                tf = sma(closes, cfg.target_ma_fast)
-                ts_val = sma(closes, cfg.target_ma_slow)
-                bars_in_base = i - long_crash_bar
+                # V8: Per-ticker LONG cooldown check
+                ticker_cooldown_ok = True
+                if cfg.long_ticker_cooldown:
+                    consec = long_ticker_consec_stops.get(ticker, 0)
+                    if consec >= cfg.long_ticker_max_consec_stops:
+                        ticker_cooldown_ok = False
 
-                trade = Trade(
-                    ticker=ticker, direction="LONG",
-                    entry_bar=i, entry_date=bar.date,
-                    entry_price=bar.close, stop_price=long_stop,
-                    target_fast=tf, target_slow=ts_val,
-                    crash_from_peak=crash_from_peak,
-                    risk_pct=risk_pct,
-                    base_duration=bars_in_base,
-                    absorption_score=abs_score,
-                    spring_detected=long_spring_detected,
-                    breakout_rvol=rvol_median,
-                    atr_contraction=atr_contraction,
-                    r_unit=r_unit,
-                    target_r1_price=target_r1,
-                    target_r2_price=target_r2,
-                )
-                trades.append(trade)
-                open_trades.append(trade)
+                if not ticker_cooldown_ok:
+                    long_phase = LONG_IDLE
+                else:
+                    r_unit = bar.close - long_stop
 
-                # Reset
-                long_phase = LONG_IDLE
-                last_long_bar = i
-                long_crash_bars_slice = []
-                long_crash_vols_slice = []
+                    # R-based targets
+                    target_r1 = bar.close + (r_unit * cfg.long_r1_target) if r_unit > 0 else 0.0
+                    target_r2 = bar.close + (r_unit * cfg.long_r2_target) if r_unit > 0 else 0.0
+
+                    tf = sma(closes, cfg.target_ma_fast)
+                    ts_val = sma(closes, cfg.target_ma_slow)
+                    bars_in_base = i - long_crash_bar
+
+                    trade = Trade(
+                        ticker=ticker, direction="LONG",
+                        entry_bar=i, entry_date=bar.date,
+                        entry_price=bar.close, stop_price=long_stop,
+                        target_fast=tf, target_slow=ts_val,
+                        crash_from_peak=crash_from_peak,
+                        risk_pct=risk_pct,
+                        base_duration=bars_in_base,
+                        absorption_score=abs_score,
+                        spring_detected=long_spring_detected,
+                        breakout_rvol=rvol_median,
+                        atr_contraction=atr_contraction,
+                        r_unit=r_unit,
+                        target_r1_price=target_r1,
+                        target_r2_price=target_r2,
+                    )
+                    trades.append(trade)
+                    open_trades.append(trade)
+
+                    # Reset
+                    long_phase = LONG_IDLE
+                    last_long_bar = i
+                    long_crash_bars_slice = []
+                    long_crash_vols_slice = []
 
             # Still check for breakdown (lost base) or timeout
             bars_since_ready = i - long_phase_bar
@@ -1407,6 +1493,7 @@ def print_grand_summary(all_trades: list, label: str = "V5 HYBRID"):
     r2_exits = [t for t in closed if t.exit_reason == "TARGET_R2"]
     trail_exits = [t for t in closed if t.exit_reason == "TRAIL_STOP"]
     time_stops = [t for t in closed if t.exit_reason == "TIME_STOP"]
+    max_loss_exits = [t for t in closed if t.exit_reason == "MAX_LOSS"]
 
     # Profit factor
     gross_profit = sum(t.pnl_pct * t.weight for t in wins) if wins else 0
@@ -1482,6 +1569,7 @@ def print_grand_summary(all_trades: list, label: str = "V5 HYBRID"):
     _reason_line("TARGET_R2:", r2_exits)
     _reason_line("TRAIL_STOP:", trail_exits)
     _reason_line("TIME_STOP:", time_stops)
+    _reason_line("MAX_LOSS:", max_loss_exits)
 
     print(f"\n  ── Extremes ──")
     print(f"  Best Trade:   {best.ticker} {best.direction} {best.entry_date} → {best.exit_date}  PnL: {best.pnl_pct:+.2f}% x{best.weight:.0%}  ({best.exit_reason})")
@@ -1698,6 +1786,7 @@ def run_walk_forward(csv_files: list, n_slices: int = 4, cfg: Config = None):
 def main():
     parser = argparse.ArgumentParser(description="Run V5 Hybrid Wyckoff/CAN SLIM backtest")
     parser.add_argument("--data-dir", help="Directory containing OHLC CSV files")
+    parser.add_argument("--extra-data", nargs="*", help="V8: Additional data directories to scan")
     parser.add_argument("--walk-forward", action="store_true", help="Run walk-forward validation")
     parser.add_argument("--forward-test", action="store_true",
                         help="Split data 70/30 for in-sample/out-of-sample comparison")
@@ -1722,7 +1811,20 @@ def main():
         print("ERROR: Data directory not found.")
         sys.exit(1)
 
+    # V8: Collect extra data directories
+    extra_dirs = args.extra_data or []
+
     csv_files = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
+    # V8: Merge CSVs from extra data directories (dedup by ticker)
+    seen_tickers = set(extract_ticker(f) for f in csv_files)
+    for edir in extra_dirs:
+        if os.path.isdir(edir):
+            for f in sorted(glob.glob(os.path.join(edir, "*.csv"))):
+                tkr = extract_ticker(f)
+                if tkr not in seen_tickers:
+                    csv_files.append(f)
+                    seen_tickers.add(tkr)
+    csv_files = sorted(csv_files, key=lambda f: extract_ticker(f))
     if not csv_files:
         print(f"ERROR: No CSV files found in {data_dir}")
         sys.exit(1)
@@ -1780,15 +1882,18 @@ def main():
     print(f"    Short Split Exit:      {cfg.short_split_exit} (V6: runner killed)")
     print(f"    Short Time Stop:       {cfg.short_time_stop} bars (V6: was 50)")
     print(f"    Circuit Breaker:       {cfg.short_circuit_breaker} (trailing {cfg.short_circuit_lookback} trades, min WR {cfg.short_circuit_min_wr}%)")
+    print(f"    Min Reward:            {cfg.short_min_reward_pct}% (V8: 10MA must be >= N% below entry)")
     print(f"    ── LONG ──")
     print(f"    Long Enabled:          {cfg.enable_long}")
-    print(f"    Long Fast Path:        {cfg.long_fast_path} (>= {cfg.fast_path_min_crash}% crash → FGD)")
+    print(f"    Long Fast Path:        {cfg.long_fast_path} (>= {cfg.fast_path_min_crash}% crash → close > prior HIGH)")
     print(f"    Long Base Path:        min {cfg.min_base_bars} bars, abs >= {cfg.absorption_threshold}")
-    print(f"    Stop Cap:              {cfg.long_stop_cap_atr_mult}x ATR")
+    print(f"    Stop Cap:              {cfg.long_stop_cap_atr_mult}x ATR / max {cfg.long_max_stop_pct}%")
+    print(f"    Ticker Cooldown:       {cfg.long_ticker_cooldown} (skip after {cfg.long_ticker_max_consec_stops} consec stops)")
     print(f"    Long Exit Mode:        {cfg.long_exit_mode}")
     print(f"    R1/R2 Targets:         {cfg.long_r1_target}R / {cfg.long_r2_target}R")
     print(f"    Long Time Stop:        {cfg.long_time_stop} bars")
     print(f"    Trail Channel:         {cfg.long_trail_channel} bars")
+    print(f"    Max Loss Cap:          {cfg.max_loss_pct}% (V8: force exit if unrealized loss exceeds)")
     print(f"    Forward Test Date:     {cfg.forward_test_date}")
 
     print(f"\n  ── Per-Ticker Results ──")
