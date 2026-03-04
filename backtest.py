@@ -1732,11 +1732,11 @@ def main():
         sys.exit(1)
 
     csv_files = sorted(
-        glob.glob(os.path.join(data_dir, "*.csv")) +
-        glob.glob(os.path.join(data_dir, "*.txt"))
+        glob.glob(os.path.join(data_dir, "**", "*.csv"), recursive=True) +
+        glob.glob(os.path.join(data_dir, "**", "*.txt"), recursive=True)
     )
     if not csv_files:
-        print(f"ERROR: No data files (*.csv, *.txt) found in {data_dir}")
+        print(f"ERROR: No data files (*.csv, *.txt) found in {data_dir} (searched recursively)")
         sys.exit(1)
 
     if args.sweep:
