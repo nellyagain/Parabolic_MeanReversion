@@ -165,6 +165,15 @@ class Config:
     # ── V8: Additional data directories ──
     extra_data_dirs: list = None  # V8: list of additional data directories to scan
 
+    # ── V8: Portfolio Simulation ──
+    portfolio_start_capital: float = 100_000.0
+    portfolio_risk_per_trade: float = 2.0     # % of equity risked per trade
+    portfolio_max_positions: int = 6          # max concurrent open positions
+    portfolio_max_per_ticker: int = 2         # max concurrent positions per ticker
+    portfolio_max_ticker_alloc: float = 25.0  # max % of equity in one ticker
+    portfolio_slippage_pct: float = 0.10      # slippage per fill (% of price)
+    portfolio_commission_per_fill: float = 1.0  # flat fee per fill (entry + exit = 2 fills)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -1841,6 +1850,334 @@ def run_walk_forward(csv_files: list, n_slices: int = 4, cfg: Config = None):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# PORTFOLIO SIMULATION — V8
+# Realistic single-portfolio with compounding, concurrency, slippage,
+# fees, overlap handling, and concentration limits.
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class PortfolioFill:
+    """Record of a portfolio-level trade execution."""
+    trade: object  # Trade reference
+    shares: float
+    entry_fill: float   # actual entry price after slippage
+    exit_fill: float    # actual exit price after slippage
+    position_value: float  # dollar value at entry
+    pnl_dollar: float
+    pnl_pct_portfolio: float  # pnl as % of equity at entry
+    equity_at_entry: float
+    fees: float
+
+
+def run_portfolio_simulation(all_trades, cfg, label="Portfolio Sim"):
+    """
+    Simulate a real portfolio with:
+    - Compounding equity
+    - Risk-based position sizing (cfg.portfolio_risk_per_trade % of equity per trade)
+    - Max concurrent positions (cfg.portfolio_max_positions)
+    - Per-ticker concentration cap (cfg.portfolio_max_per_ticker, cfg.portfolio_max_ticker_alloc)
+    - Slippage on every fill (cfg.portfolio_slippage_pct)
+    - Commission on every fill (cfg.portfolio_commission_per_fill)
+    - Overlap handling (trades sorted by entry_bar, exits processed first)
+    """
+    start_capital = cfg.portfolio_start_capital
+    risk_pct = cfg.portfolio_risk_per_trade
+    max_pos = cfg.portfolio_max_positions
+    max_per_ticker = cfg.portfolio_max_per_ticker
+    max_ticker_alloc = cfg.portfolio_max_ticker_alloc / 100.0
+    slip_pct = cfg.portfolio_slippage_pct / 100.0
+    comm = cfg.portfolio_commission_per_fill
+
+    # Filter to original setups only (no runner legs — they're part of the parent position)
+    # But we need runner legs for partial exits. Group by (ticker, entry_bar, entry_date)
+    # and treat each setup + its runners as one position.
+
+    # Build position groups: each original entry + its runner legs
+    closed = [t for t in all_trades if t.exit_bar >= 0 and t.exit_reason not in ("OPEN_AT_END", "")]
+    if not closed:
+        print(f"\n  No closed trades for portfolio simulation.")
+        return
+
+    # Group trades into positions: (ticker, entry_date, entry_price) → list of legs
+    from collections import defaultdict
+    position_groups = defaultdict(list)
+    for t in closed:
+        key = (t.ticker, t.entry_date, t.entry_price)
+        position_groups[key].append(t)
+
+    # Build event timeline: (bar_index, event_type, position_key, leg)
+    # event_type: 'exit' processed before 'entry' on same bar
+    events = []
+    for key, legs in position_groups.items():
+        # Entry event on the first leg's entry_bar
+        first_leg = legs[0]
+        events.append((first_leg.entry_bar, 1, 'entry', key, first_leg))  # 1 = entry sort order
+        # Exit events for each leg
+        for leg in legs:
+            events.append((leg.exit_bar, 0, 'exit', key, leg))  # 0 = exit sort order (before entry)
+
+    # Sort: by bar, then exits before entries
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    # Portfolio state
+    equity = start_capital
+    peak_equity = start_capital
+    max_dd_pct = 0.0
+    max_dd_dollar = 0.0
+
+    # Open positions: key → {shares, entry_fill, equity_at_entry, remaining_weight, legs_filled}
+    open_positions = {}
+    fills = []
+    equity_curve = [(0, equity)]  # (bar, equity)
+
+    # Track per-ticker exposure
+    ticker_open_count = defaultdict(int)  # ticker → count of open positions
+    ticker_open_value = defaultdict(float)  # ticker → total dollar value open
+
+    skipped_capacity = 0
+    skipped_concentration = 0
+    skipped_capital = 0
+    total_fees = 0.0
+    total_slippage = 0.0
+
+    for event in events:
+        bar_idx, sort_order, etype, key, leg = event
+
+        if etype == 'exit' and key in open_positions:
+            pos = open_positions[key]
+            # Calculate exit fill with slippage
+            raw_exit = leg.exit_price
+            if leg.direction == "LONG":
+                exit_fill = raw_exit * (1 - slip_pct)  # slippage works against you
+            else:
+                exit_fill = raw_exit * (1 + slip_pct)
+
+            # PnL for this leg
+            leg_shares = pos['shares'] * leg.weight
+            if leg.direction == "LONG":
+                leg_pnl = (exit_fill - pos['entry_fill']) * leg_shares
+            else:
+                leg_pnl = (pos['entry_fill'] - exit_fill) * leg_shares
+
+            # Fees
+            exit_fee = comm
+            leg_pnl -= exit_fee
+            total_fees += exit_fee
+
+            slip_cost = abs(raw_exit - exit_fill) * leg_shares
+            total_slippage += slip_cost
+
+            pnl_pct_port = (leg_pnl / pos['equity_at_entry']) * 100 if pos['equity_at_entry'] > 0 else 0
+
+            equity += leg_pnl
+            pos['remaining_weight'] -= leg.weight
+
+            fills.append(PortfolioFill(
+                trade=leg, shares=leg_shares,
+                entry_fill=pos['entry_fill'], exit_fill=exit_fill,
+                position_value=pos['shares'] * pos['entry_fill'],
+                pnl_dollar=leg_pnl, pnl_pct_portfolio=pnl_pct_port,
+                equity_at_entry=pos['equity_at_entry'], fees=exit_fee,
+            ))
+
+            # If all weight exited, close position
+            if pos['remaining_weight'] <= 0.01:
+                ticker_open_count[key[0]] -= 1
+                ticker_open_value[key[0]] -= pos['shares'] * pos['entry_fill']
+                del open_positions[key]
+
+            # Update equity curve and drawdown
+            equity_curve.append((bar_idx, equity))
+            if equity > peak_equity:
+                peak_equity = equity
+            dd_pct = (peak_equity - equity) / peak_equity * 100 if peak_equity > 0 else 0
+            dd_dollar = peak_equity - equity
+            if dd_pct > max_dd_pct:
+                max_dd_pct = dd_pct
+            if dd_dollar > max_dd_dollar:
+                max_dd_dollar = dd_dollar
+
+        elif etype == 'entry' and key not in open_positions:
+            ticker = key[0]
+
+            # Check capacity
+            if len(open_positions) >= max_pos:
+                skipped_capacity += 1
+                continue
+
+            # Check per-ticker concentration
+            if ticker_open_count[ticker] >= max_per_ticker:
+                skipped_concentration += 1
+                continue
+
+            # Check ticker allocation cap
+            if equity > 0 and ticker_open_value[ticker] / equity > max_ticker_alloc:
+                skipped_concentration += 1
+                continue
+
+            # Position sizing: risk_pct of equity / risk per share
+            if leg.risk_pct <= 0 or equity <= 0:
+                skipped_capital += 1
+                continue
+
+            risk_per_share = abs(leg.entry_price - leg.stop_price)
+            if risk_per_share <= 0:
+                skipped_capital += 1
+                continue
+
+            dollar_risk = equity * (risk_pct / 100.0)
+            shares = dollar_risk / risk_per_share
+            position_value = shares * leg.entry_price
+
+            # Cap position at max_ticker_alloc of equity
+            max_value = equity * max_ticker_alloc
+            if position_value > max_value:
+                shares = max_value / leg.entry_price
+                position_value = max_value
+
+            # Entry fill with slippage
+            if leg.direction == "LONG":
+                entry_fill = leg.entry_price * (1 + slip_pct)
+            else:
+                entry_fill = leg.entry_price * (1 - slip_pct)
+
+            # Entry fee
+            entry_fee = comm
+            total_fees += entry_fee
+            equity -= entry_fee  # deduct entry commission immediately
+
+            slip_cost = abs(leg.entry_price - entry_fill) * shares
+            total_slippage += slip_cost
+
+            open_positions[key] = {
+                'shares': shares,
+                'entry_fill': entry_fill,
+                'equity_at_entry': equity,
+                'remaining_weight': 1.0,
+            }
+            ticker_open_count[ticker] += 1
+            ticker_open_value[ticker] += position_value
+
+            equity_curve.append((bar_idx, equity))
+
+    # ── Results ──
+    final_equity = equity
+    total_return = (final_equity - start_capital) / start_capital * 100
+    n_fills = len(fills)
+    n_positions = len(position_groups)
+    n_taken = n_positions - skipped_capacity - skipped_concentration - skipped_capital
+
+    winners = [f for f in fills if f.pnl_dollar > 0]
+    losers = [f for f in fills if f.pnl_dollar <= 0]
+    win_rate = len(winners) / len(fills) * 100 if fills else 0
+
+    gross_profit = sum(f.pnl_dollar for f in winners) if winners else 0
+    gross_loss = abs(sum(f.pnl_dollar for f in losers)) if losers else 0
+    pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+
+    # CAGR — use actual trade dates, not bar indices
+    from datetime import datetime
+    all_dates = []
+    for f in fills:
+        try:
+            all_dates.append(datetime.strptime(f.trade.entry_date, "%Y-%m-%d"))
+            all_dates.append(datetime.strptime(f.trade.exit_date, "%Y-%m-%d"))
+        except (ValueError, AttributeError):
+            pass
+    if all_dates:
+        first_date = min(all_dates)
+        last_date = max(all_dates)
+        days_span = (last_date - first_date).days
+        years = days_span / 365.25 if days_span > 0 else 1.0
+        cagr = ((final_equity / start_capital) ** (1.0 / years) - 1) * 100 if years > 0 else 0
+    else:
+        years = 1.0
+        cagr = 0.0
+
+    # Per-ticker PnL
+    ticker_pnl = defaultdict(float)
+    for f in fills:
+        ticker_pnl[f.trade.ticker] += f.pnl_dollar
+    sorted_ticker_pnl = sorted(ticker_pnl.items(), key=lambda x: x[1], reverse=True)
+
+    print("\n" + "=" * 100)
+    print(f"  PORTFOLIO SIMULATION — {label}")
+    print("=" * 100)
+    print(f"\n  ── Capital & Sizing ──")
+    print(f"  Starting Capital:        ${start_capital:,.0f}")
+    print(f"  Risk Per Trade:          {risk_pct}% of equity")
+    print(f"  Max Concurrent:          {max_pos} positions")
+    print(f"  Max Per Ticker:          {max_per_ticker} concurrent / {cfg.portfolio_max_ticker_alloc}% of equity")
+    print(f"  Slippage:                {cfg.portfolio_slippage_pct}% per fill")
+    print(f"  Commission:              ${comm:.2f} per fill")
+
+    print(f"\n  ── Execution ──")
+    print(f"  Total Setups Available:  {n_positions}")
+    print(f"  Positions Taken:         {n_taken}")
+    print(f"  Skipped (capacity):      {skipped_capacity}")
+    print(f"  Skipped (concentration): {skipped_concentration}")
+    print(f"  Skipped (capital/risk):  {skipped_capital}")
+    print(f"  Total Fills (legs):      {n_fills}")
+
+    print(f"\n  ── Performance ──")
+    print(f"  Final Equity:            ${final_equity:,.2f}")
+    print(f"  Total Return:            {total_return:+.2f}%")
+    print(f"  CAGR:                    {cagr:+.2f}% ({years:.1f} years)")
+    print(f"  Profit Factor:           {pf:.2f}")
+    print(f"  Win Rate (fills):        {win_rate:.1f}%")
+    print(f"  Avg Win:                 ${sum(f.pnl_dollar for f in winners) / len(winners):,.2f}" if winners else "  Avg Win:                 $0")
+    print(f"  Avg Loss:                ${sum(f.pnl_dollar for f in losers) / len(losers):,.2f}" if losers else "  Avg Loss:                $0")
+
+    print(f"\n  ── Drawdown ──")
+    print(f"  Max Drawdown:            {max_dd_pct:.2f}% (${max_dd_dollar:,.0f})")
+    print(f"  Peak Equity:             ${peak_equity:,.2f}")
+
+    print(f"\n  ── Friction Costs ──")
+    print(f"  Total Slippage:          ${total_slippage:,.2f}")
+    print(f"  Total Commissions:       ${total_fees:,.2f}")
+    print(f"  Total Friction:          ${total_slippage + total_fees:,.2f} ({(total_slippage + total_fees) / start_capital * 100:.2f}% of starting capital)")
+
+    print(f"\n  ── Concentration ──")
+    if sorted_ticker_pnl:
+        total_dollar_pnl = final_equity - start_capital
+        for i, (tkr, pnl) in enumerate(sorted_ticker_pnl[:5]):
+            pct_of_total = pnl / total_dollar_pnl * 100 if total_dollar_pnl != 0 else 0
+            print(f"  #{i+1} {tkr:<8}  ${pnl:>+12,.2f}  ({pct_of_total:>+6.1f}% of total PnL)")
+        print(f"  ---")
+        top1_pnl = sorted_ticker_pnl[0][1] if sorted_ticker_pnl else 0
+        top2_pnl = sum(p for _, p in sorted_ticker_pnl[:2])
+        ex_top1 = total_dollar_pnl - top1_pnl
+        ex_top2 = total_dollar_pnl - top2_pnl
+        print(f"  Ex-Top-1 PnL:            ${ex_top1:>+,.2f}")
+        print(f"  Ex-Top-2 PnL:            ${ex_top2:>+,.2f}")
+        n_profit_tickers = sum(1 for _, p in sorted_ticker_pnl if p > 0)
+        print(f"  Profitable Tickers:      {n_profit_tickers}/{len(sorted_ticker_pnl)}")
+
+    # Bottom 5
+    if len(sorted_ticker_pnl) > 5:
+        print(f"\n  ── Worst Tickers ──")
+        for tkr, pnl in sorted_ticker_pnl[-5:]:
+            print(f"  {tkr:<8}  ${pnl:>+12,.2f}")
+
+    print("\n" + "=" * 100)
+
+    return {
+        'final_equity': final_equity,
+        'total_return': total_return,
+        'cagr': cagr,
+        'pf': pf,
+        'max_dd_pct': max_dd_pct,
+        'max_dd_dollar': max_dd_dollar,
+        'win_rate': win_rate,
+        'n_taken': n_taken,
+        'n_fills': n_fills,
+        'total_friction': total_slippage + total_fees,
+        'skipped_capacity': skipped_capacity,
+        'skipped_concentration': skipped_concentration,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1922,9 +2259,11 @@ def main():
 
         print(f"\n  ═══ IN-SAMPLE (before {cutoff_date}) ═══")
         print_grand_summary(is_trades, label=f"V6 HYBRID — IS (before {cutoff_date})")
+        run_portfolio_simulation(is_trades, cfg, label=f"IS (before {cutoff_date})")
 
         print(f"\n  ═══ OUT-OF-SAMPLE ({cutoff_date}+) ═══")
         print_grand_summary(oos_trades, label=f"V6 HYBRID — OOS ({cutoff_date}+)")
+        run_portfolio_simulation(oos_trades, cfg, label=f"OOS ({cutoff_date}+)")
         return
 
     if args.walk_forward:
@@ -1971,6 +2310,7 @@ def main():
         print_ticker_summary(ticker, t_trades)
 
     print_grand_summary(all_trades, label="V5 HYBRID")
+    run_portfolio_simulation(all_trades, cfg, label="FULL BACKTEST")
 
 
 if __name__ == "__main__":
