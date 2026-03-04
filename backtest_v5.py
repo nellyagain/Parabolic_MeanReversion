@@ -2177,6 +2177,102 @@ def run_portfolio_simulation(all_trades, cfg, label="Portfolio Sim"):
     }
 
 
+def run_concentration_stress_test(all_trades, cfg, label="Stress Test"):
+    """
+    Run portfolio sim under multiple concentration regimes and compare.
+    """
+    from copy import copy
+    scenarios = [
+        # (label, max_per_ticker, max_ticker_alloc_pct)
+        ("Loose (2/ticker, 30%)",   2, 30.0),
+        ("Current (2/ticker, 25%)", 2, 25.0),
+        ("Moderate (1/ticker, 20%)", 1, 20.0),
+        ("Tight (1/ticker, 15%)",   1, 15.0),
+        ("Very Tight (1/ticker, 10%)", 1, 10.0),
+    ]
+
+    # Also test max concurrent positions
+    concurrency_scenarios = [
+        # (label, max_positions)
+        ("8 concurrent", 8),
+        ("6 concurrent (current)", 6),
+        ("4 concurrent", 4),
+        ("3 concurrent", 3),
+    ]
+
+    results = []
+    print("\n" + "=" * 100)
+    print(f"  CONCENTRATION STRESS TEST — {label}")
+    print("=" * 100)
+
+    # Suppress per-scenario verbose output by redirecting
+    import io, sys
+
+    print(f"\n  ── Per-Ticker Concentration Limits (max {cfg.portfolio_max_positions} concurrent) ──")
+    print(f"  {'Scenario':<28} {'Return':>8} {'CAGR':>7} {'PF':>6} {'MaxDD':>7} {'Taken':>6} {'Skip':>6} {'Top1%':>7}")
+    print(f"  {'─'*28} {'─'*8} {'─'*7} {'─'*6} {'─'*7} {'─'*6} {'─'*6} {'─'*7}")
+
+    for scenario_label, max_per, max_alloc in scenarios:
+        test_cfg = copy(cfg)
+        test_cfg.portfolio_max_per_ticker = max_per
+        test_cfg.portfolio_max_ticker_alloc = max_alloc
+
+        # Capture and suppress output
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        res = run_portfolio_simulation(all_trades, test_cfg, label=scenario_label)
+        sys.stdout = old_stdout
+
+        if res:
+            # Compute top1 concentration from fills
+            from collections import defaultdict
+            ticker_pnl = defaultdict(float)
+            closed = [t for t in all_trades if t.exit_bar >= 0 and t.exit_reason not in ("OPEN_AT_END", "")]
+            # Re-derive from result
+            total_pnl = res['final_equity'] - cfg.portfolio_start_capital
+            top1_pct = "N/A"
+
+            print(f"  {scenario_label:<28} {res['total_return']:>+7.1f}% {res['cagr']:>+6.1f}% {res['pf']:>5.2f} {res['max_dd_pct']:>6.1f}% {res['n_taken']:>5} {res['skipped_concentration']:>5}   —")
+            results.append((scenario_label, res))
+
+    # Concurrency stress
+    print(f"\n  ── Max Concurrent Positions ({cfg.portfolio_max_per_ticker}/ticker, {cfg.portfolio_max_ticker_alloc}% alloc) ──")
+    print(f"  {'Scenario':<28} {'Return':>8} {'CAGR':>7} {'PF':>6} {'MaxDD':>7} {'Taken':>6} {'SkipCap':>8}")
+    print(f"  {'─'*28} {'─'*8} {'─'*7} {'─'*6} {'─'*7} {'─'*6} {'─'*8}")
+
+    for scenario_label, max_pos in concurrency_scenarios:
+        test_cfg = copy(cfg)
+        test_cfg.portfolio_max_positions = max_pos
+
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        res = run_portfolio_simulation(all_trades, test_cfg, label=scenario_label)
+        sys.stdout = old_stdout
+
+        if res:
+            print(f"  {scenario_label:<28} {res['total_return']:>+7.1f}% {res['cagr']:>+6.1f}% {res['pf']:>5.2f} {res['max_dd_pct']:>6.1f}% {res['n_taken']:>5} {res['skipped_capacity']:>7}")
+
+    # Slippage sensitivity
+    print(f"\n  ── Slippage Sensitivity ({cfg.portfolio_max_positions} concurrent, {cfg.portfolio_max_per_ticker}/ticker) ──")
+    print(f"  {'Scenario':<28} {'Return':>8} {'CAGR':>7} {'PF':>6} {'MaxDD':>7} {'Friction':>10}")
+    print(f"  {'─'*28} {'─'*8} {'─'*7} {'─'*6} {'─'*7} {'─'*10}")
+
+    for slip_label, slip_pct in [("Zero slip", 0.0), ("0.05% slip", 0.05), ("0.10% slip (current)", 0.10), ("0.20% slip", 0.20), ("0.50% slip (worst case)", 0.50)]:
+        test_cfg = copy(cfg)
+        test_cfg.portfolio_slippage_pct = slip_pct
+
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        res = run_portfolio_simulation(all_trades, test_cfg, label=slip_label)
+        sys.stdout = old_stdout
+
+        if res:
+            print(f"  {slip_label:<28} {res['total_return']:>+7.1f}% {res['cagr']:>+6.1f}% {res['pf']:>5.2f} {res['max_dd_pct']:>6.1f}% ${res['total_friction']:>9,.0f}")
+
+    print("\n" + "=" * 100)
+    return results
+
+
 # ═══════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
@@ -2189,6 +2285,8 @@ def main():
     parser.add_argument("--forward-test", action="store_true",
                         help="Split data 70/30 for in-sample/out-of-sample comparison")
     parser.add_argument("--long-only", action="store_true", help="Run LONG side only")
+    parser.add_argument("--stress-test", action="store_true",
+                        help="Run concentration/slippage stress test on portfolio sim")
     parser.add_argument("--compare", action="store_true", help="Run both V4 and V5 for comparison")
 
     args = parser.parse_args()
@@ -2264,6 +2362,10 @@ def main():
         print(f"\n  ═══ OUT-OF-SAMPLE ({cutoff_date}+) ═══")
         print_grand_summary(oos_trades, label=f"V6 HYBRID — OOS ({cutoff_date}+)")
         run_portfolio_simulation(oos_trades, cfg, label=f"OOS ({cutoff_date}+)")
+
+        if args.stress_test:
+            run_concentration_stress_test(is_trades, cfg, label=f"IS STRESS (before {cutoff_date})")
+            run_concentration_stress_test(oos_trades, cfg, label=f"OOS STRESS ({cutoff_date}+)")
         return
 
     if args.walk_forward:
@@ -2311,6 +2413,9 @@ def main():
 
     print_grand_summary(all_trades, label="V5 HYBRID")
     run_portfolio_simulation(all_trades, cfg, label="FULL BACKTEST")
+
+    if args.stress_test:
+        run_concentration_stress_test(all_trades, cfg, label="FULL BACKTEST STRESS")
 
 
 if __name__ == "__main__":
