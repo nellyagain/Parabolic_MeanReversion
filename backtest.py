@@ -1197,6 +1197,440 @@ def run_sweep(csv_files: list):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# SHORT STOP MODE SWEEP
+# ═══════════════════════════════════════════════════════════════════
+
+def run_short_stop_sweep(csv_files: list):
+    """Sweep SHORT stop modes (Run Peak, Trigger Bar High, ATR Based) with multipliers."""
+    from dataclasses import replace
+
+    base_cfg = Config()
+
+    # Preload all bar data
+    ticker_bars = []
+    for csv_file in csv_files:
+        ticker = extract_ticker(csv_file)
+        bars = load_csv(csv_file)
+        ticker_bars.append((ticker, bars))
+
+    stop_modes = ["Run Peak", "Trigger Bar High", "ATR Based"]
+    atr_mults = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]  # only relevant for ATR Based
+    results = []
+
+    print(f"\n  ═══ SHORT STOP MODE SWEEP ═══")
+    print(f"  LONG side: frozen at ATR 2.5x, vel 3.0, SC 3.0 (best config)")
+    print(f"  Testing SHORT stop modes: {stop_modes}")
+    print(f"  ATR multipliers (for ATR Based): {atr_mults}\n")
+
+    header = (f"  {'#':>3} {'StopMode':<18} {'ATR_M':>5} "
+              f"{'Setups':>6} {'S':>4} {'L':>4} {'WR%':>6} {'AvgPnL':>8} "
+              f"{'PF':>6} {'CumPnL':>9} {'AvgWin':>8} {'AvgLoss':>8} {'MaxDD':>7} "
+              f"{'S_WR%':>6} {'S_AvgPnL':>9} {'S_PF':>6}")
+    print(header)
+
+    combo_num = 0
+    for stop_mode in stop_modes:
+        mults = atr_mults if stop_mode == "ATR Based" else [0.0]
+        for atr_m in mults:
+            combo_num += 1
+            # Freeze LONG at best config; only vary SHORT stop
+            cfg = replace(base_cfg,
+                          short_stop_mode=stop_mode,
+                          atr_mult=atr_m if stop_mode == "ATR Based" else 2.5,
+                          # LONG frozen at best V4 config
+                          long_stop_mode="ATR Based",
+                          crash_velocity_min=3.0,
+                          require_selling_climax=True,
+                          selling_climax_rvol=3.0,
+                          )
+            # For non-ATR short modes, LONG still needs its own ATR mult
+            if stop_mode != "ATR Based":
+                cfg = replace(cfg, atr_mult=2.5)
+
+            all_trades = []
+            for ticker, bars in ticker_bars:
+                trades = run_backtest(ticker, bars, cfg)
+                all_trades.extend(trades)
+
+            closed = [t for t in all_trades if t.exit_reason not in ("OPEN_AT_END", "")]
+            if not closed:
+                continue
+
+            setups = [t for t in all_trades if not t.is_runner]
+            shorts_n = len([t for t in setups if t.direction == "SHORT"])
+            longs_n = len([t for t in setups if t.direction == "LONG"])
+
+            wins = [t for t in closed if t.pnl_pct > 0]
+            losses = [t for t in closed if t.pnl_pct <= 0]
+            total_weight = sum(t.weight for t in closed)
+            win_weight = sum(t.weight for t in wins)
+            wr = win_weight / total_weight * 100 if total_weight > 0 else 0
+            total_pnl = sum(t.pnl_pct * t.weight for t in closed)
+            avg_pnl = total_pnl / total_weight if total_weight > 0 else 0
+            gross_profit = sum(t.pnl_pct * t.weight for t in wins)
+            gross_loss = abs(sum(t.pnl_pct * t.weight for t in losses))
+            pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+            avg_win = _weighted_avg(wins) if wins else 0
+            avg_loss = _weighted_avg(losses) if losses else 0
+
+            # Max drawdown
+            cumulative = 0.0
+            peak_cum = 0.0
+            max_dd = 0.0
+            for t in sorted(closed, key=lambda x: (x.exit_bar, -x.is_runner)):
+                cumulative += t.pnl_pct * t.weight
+                if cumulative > peak_cum:
+                    peak_cum = cumulative
+                dd = peak_cum - cumulative
+                if dd > max_dd:
+                    max_dd = dd
+
+            # SHORT-only metrics
+            s_closed = [t for t in closed if t.direction == "SHORT"]
+            s_wins = [t for t in s_closed if t.pnl_pct > 0]
+            s_losses = [t for t in s_closed if t.pnl_pct <= 0]
+            s_wt = sum(t.weight for t in s_closed)
+            s_win_wt = sum(t.weight for t in s_wins)
+            s_wr = s_win_wt / s_wt * 100 if s_wt > 0 else 0
+            s_avg = _weighted_avg(s_closed) if s_closed else 0
+            s_gp = sum(t.pnl_pct * t.weight for t in s_wins)
+            s_gl = abs(sum(t.pnl_pct * t.weight for t in s_losses))
+            s_pf = s_gp / s_gl if s_gl > 0 else float('inf')
+
+            atr_str = f"{atr_m:.1f}" if stop_mode == "ATR Based" else "n/a"
+            print(f"  {combo_num:>3} {stop_mode:<18} {atr_str:>5} "
+                  f"{len(setups):>6} {shorts_n:>4} {longs_n:>4} {wr:>5.1f}% {avg_pnl:>+7.2f}% "
+                  f"{pf:>5.2f} {total_pnl:>+8.1f}% {avg_win:>+7.2f}% {avg_loss:>+7.2f}% {max_dd:>6.1f}% "
+                  f"{s_wr:>5.1f}% {s_avg:>+8.2f}% {s_pf:>5.2f}")
+
+            results.append({
+                'stop_mode': stop_mode, 'atr_mult': atr_m,
+                'setups': len(setups), 'shorts': shorts_n, 'longs': longs_n,
+                'wr': wr, 'avg_pnl': avg_pnl, 'pf': pf,
+                'cum_pnl': total_pnl, 'max_dd': max_dd,
+                's_wr': s_wr, 's_avg_pnl': s_avg, 's_pf': s_pf,
+            })
+
+    # Best SHORT-only PF
+    print(f"\n  ═══ RANKED BY SHORT PROFIT FACTOR ═══")
+    ranked = sorted(results, key=lambda r: r['s_pf'], reverse=True)
+    for idx, r in enumerate(ranked, 1):
+        atr_str = f"{r['atr_mult']:.1f}" if r['stop_mode'] == "ATR Based" else "n/a"
+        print(f"  {idx:>3} {r['stop_mode']:<18} ATR={atr_str:>4} | "
+              f"S_PF: {r['s_pf']:>5.2f} | S_WR: {r['s_wr']:>5.1f}% | S_AvgPnL: {r['s_avg_pnl']:>+7.2f}% | "
+              f"Combined PF: {r['pf']:>5.2f} | CumPnL: {r['cum_pnl']:>+8.1f}%")
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════
+# WALK-FORWARD VALIDATION (Time-Split OOS)
+# ═══════════════════════════════════════════════════════════════════
+
+def _compute_slice_stats(trades):
+    """Compute stats for a time slice of trades."""
+    closed = [t for t in trades if t.exit_reason not in ("OPEN_AT_END", "")]
+    if not closed:
+        return None
+
+    setups = [t for t in trades if not t.is_runner]
+    wins = [t for t in closed if t.pnl_pct > 0]
+    losses = [t for t in closed if t.pnl_pct <= 0]
+    total_weight = sum(t.weight for t in closed)
+    win_weight = sum(t.weight for t in wins)
+    wr = win_weight / total_weight * 100 if total_weight > 0 else 0
+    total_pnl = sum(t.pnl_pct * t.weight for t in closed)
+    avg_pnl = total_pnl / total_weight if total_weight > 0 else 0
+    gross_profit = sum(t.pnl_pct * t.weight for t in wins)
+    gross_loss = abs(sum(t.pnl_pct * t.weight for t in losses))
+    pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+
+    # R-based metrics
+    r_trades = [t for t in closed if t.risk_pct > 0]
+    r_wt = sum(t.weight for t in r_trades)
+    avg_r = sum(t.r_multiple * t.weight for t in r_trades) / r_wt if r_wt > 0 else 0
+    expectancy_r = avg_r  # per-trade expectancy in R
+
+    # Max drawdown in R terms
+    cum_r = 0.0
+    peak_r = 0.0
+    max_dd_r = 0.0
+    for t in sorted(r_trades, key=lambda x: (x.exit_bar, -x.is_runner)):
+        cum_r += t.r_multiple * t.weight
+        if cum_r > peak_r:
+            peak_r = cum_r
+        dd = peak_r - cum_r
+        if dd > max_dd_r:
+            max_dd_r = dd
+
+    # Max drawdown in %
+    cumulative = 0.0
+    peak_cum = 0.0
+    max_dd = 0.0
+    for t in sorted(closed, key=lambda x: (x.exit_bar, -x.is_runner)):
+        cumulative += t.pnl_pct * t.weight
+        if cumulative > peak_cum:
+            peak_cum = cumulative
+        dd = peak_cum - cumulative
+        if dd > max_dd:
+            max_dd = dd
+
+    shorts = [t for t in setups if t.direction == "SHORT"]
+    longs = [t for t in setups if t.direction == "LONG"]
+
+    return {
+        'setups': len(setups), 'shorts': len(shorts), 'longs': len(longs),
+        'legs': len(closed),
+        'wr': wr, 'avg_pnl': avg_pnl, 'pf': pf,
+        'cum_pnl': total_pnl, 'max_dd': max_dd,
+        'avg_r': avg_r, 'expectancy_r': expectancy_r, 'max_dd_r': max_dd_r,
+    }
+
+
+def run_walk_forward(csv_files: list, n_slices: int = 4, cfg: 'Config' = None):
+    """Time-split walk-forward validation. Splits each ticker's bars into N
+    chronological slices and evaluates each independently."""
+    from dataclasses import replace
+
+    if cfg is None:
+        cfg = Config(
+            short_stop_mode="Run Peak",
+            long_stop_mode="ATR Based",
+            atr_mult=2.5,
+            crash_velocity_min=3.0,
+            require_selling_climax=True,
+            selling_climax_rvol=3.0,
+        )
+
+    # Preload all bar data
+    ticker_bars = []
+    for csv_file in csv_files:
+        ticker = extract_ticker(csv_file)
+        bars = load_csv(csv_file)
+        ticker_bars.append((ticker, bars))
+
+    # Determine global time range
+    all_timestamps = []
+    for _, bars in ticker_bars:
+        all_timestamps.extend(b.timestamp for b in bars)
+    t_min = min(all_timestamps)
+    t_max = max(all_timestamps)
+    slice_size = (t_max - t_min) / n_slices
+    slice_boundaries = [(t_min + int(i * slice_size), t_min + int((i + 1) * slice_size))
+                        for i in range(n_slices)]
+
+    print(f"\n  ═══ WALK-FORWARD VALIDATION ({n_slices} time slices) ═══")
+    print(f"  Config: short_stop={cfg.short_stop_mode}, long_stop={cfg.long_stop_mode}, "
+          f"atr_mult={cfg.atr_mult}, vel={cfg.crash_velocity_min}, sc_rvol={cfg.selling_climax_rvol}")
+
+    from datetime import datetime, timezone as tz
+    for i, (t_start, t_end) in enumerate(slice_boundaries):
+        d_start = datetime.fromtimestamp(t_start, tz=tz.utc).strftime('%Y-%m-%d')
+        d_end = datetime.fromtimestamp(t_end, tz=tz.utc).strftime('%Y-%m-%d')
+        print(f"  Slice {i+1}: {d_start} → {d_end}")
+
+    # Run backtest on full data, then split trades by exit timestamp into slices
+    all_trades = []
+    for ticker, bars in ticker_bars:
+        trades = run_backtest(ticker, bars, cfg)
+        # Attach exit timestamp for slicing
+        for t in trades:
+            if t.exit_bar >= 0 and t.exit_bar < len(bars):
+                t._exit_ts = bars[t.exit_bar].timestamp
+            else:
+                t._exit_ts = bars[-1].timestamp
+        all_trades.extend(trades)
+
+    slice_results = []
+    print(f"\n  {'Slice':>5} {'Period':<25} {'Setups':>6} {'S':>4} {'L':>4} {'WR%':>6} "
+          f"{'AvgPnL':>8} {'PF':>6} {'CumPnL':>9} {'MaxDD':>7} "
+          f"{'AvgR':>6} {'ExpR':>6} {'MaxDD_R':>7}")
+
+    for i, (t_start, t_end) in enumerate(slice_boundaries):
+        d_start = datetime.fromtimestamp(t_start, tz=tz.utc).strftime('%Y-%m-%d')
+        d_end = datetime.fromtimestamp(t_end, tz=tz.utc).strftime('%Y-%m-%d')
+
+        slice_trades = [t for t in all_trades if t_start <= t._exit_ts < t_end]
+        stats = _compute_slice_stats(slice_trades)
+        if stats is None:
+            print(f"  {i+1:>5} {d_start} → {d_end:<14} {'(no trades)':>6}")
+            slice_results.append(None)
+            continue
+
+        slice_results.append(stats)
+        print(f"  {i+1:>5} {d_start} → {d_end:<14} {stats['setups']:>6} {stats['shorts']:>4} {stats['longs']:>4} "
+              f"{stats['wr']:>5.1f}% {stats['avg_pnl']:>+7.2f}% {stats['pf']:>5.2f} "
+              f"{stats['cum_pnl']:>+8.1f}% {stats['max_dd']:>6.1f}% "
+              f"{stats['avg_r']:>+5.2f}R {stats['expectancy_r']:>+5.2f}R {stats['max_dd_r']:>6.2f}R")
+
+    # Aggregate (full period)
+    full_stats = _compute_slice_stats(all_trades)
+    if full_stats:
+        print(f"  {'FULL':>5} {'(all periods)':<25} {full_stats['setups']:>6} {full_stats['shorts']:>4} {full_stats['longs']:>4} "
+              f"{full_stats['wr']:>5.1f}% {full_stats['avg_pnl']:>+7.2f}% {full_stats['pf']:>5.2f} "
+              f"{full_stats['cum_pnl']:>+8.1f}% {full_stats['max_dd']:>6.1f}% "
+              f"{full_stats['avg_r']:>+5.2f}R {full_stats['expectancy_r']:>+5.2f}R {full_stats['max_dd_r']:>6.2f}R")
+
+    # Stability check
+    valid_slices = [s for s in slice_results if s is not None]
+    if valid_slices:
+        pfs = [s['pf'] for s in valid_slices]
+        avg_pnls = [s['avg_pnl'] for s in valid_slices]
+        exp_rs = [s['expectancy_r'] for s in valid_slices]
+        profitable_slices = sum(1 for s in valid_slices if s['pf'] > 1.0)
+        pf_above_1_1 = sum(1 for s in valid_slices if s['pf'] > 1.1)
+
+        print(f"\n  ── Stability Assessment ──")
+        print(f"  Profitable slices (PF>1.0):  {profitable_slices}/{len(valid_slices)}")
+        print(f"  Robust slices (PF>1.1):      {pf_above_1_1}/{len(valid_slices)}")
+        print(f"  PF range:                    {min(pfs):.2f} – {max(pfs):.2f}")
+        print(f"  Avg PnL range:               {min(avg_pnls):+.2f}% – {max(avg_pnls):+.2f}%")
+        print(f"  Expectancy(R) range:         {min(exp_rs):+.2f}R – {max(exp_rs):+.2f}R")
+
+        # Verdict
+        if profitable_slices == len(valid_slices) and pf_above_1_1 >= len(valid_slices) // 2:
+            print(f"  VERDICT: PASS — edge is stable across time periods")
+        elif profitable_slices >= len(valid_slices) * 0.5:
+            print(f"  VERDICT: MARGINAL — edge present in some periods but not consistent")
+        else:
+            print(f"  VERDICT: FAIL — no stable edge across time periods")
+
+    return slice_results
+
+
+# ═══════════════════════════════════════════════════════════════════
+# RISK-NORMALIZED EQUITY CURVE
+# ═══════════════════════════════════════════════════════════════════
+
+def run_risk_normalized(csv_files: list, cfg: 'Config' = None,
+                        alloc_pct: float = 5.0,
+                        max_concurrent: int = 5,
+                        max_dd_breaker_pct: float = 25.0,
+                        starting_capital: float = 100000.0):
+    """Simulate with equal-dollar position sizing (fixed % of equity per trade),
+    concurrent exposure cap, and drawdown circuit breaker.
+    Uses % PnL sizing (not R-based) because the strategy's edge is from win rate."""
+    if cfg is None:
+        cfg = Config(
+            short_stop_mode="Run Peak",
+            long_stop_mode="ATR Based",
+            atr_mult=2.5,
+            crash_velocity_min=3.0,
+            require_selling_climax=True,
+            selling_climax_rvol=3.0,
+        )
+
+    # Collect all trades with proper timestamps
+    all_trades = []
+    for csv_file in csv_files:
+        ticker = extract_ticker(csv_file)
+        bars = load_csv(csv_file)
+        trades = run_backtest(ticker, bars, cfg)
+        for t in trades:
+            if t.entry_bar < len(bars):
+                t._entry_ts = bars[t.entry_bar].timestamp
+            if t.exit_bar >= 0 and t.exit_bar < len(bars):
+                t._exit_ts = bars[t.exit_bar].timestamp
+            else:
+                t._exit_ts = bars[-1].timestamp
+        all_trades.extend(trades)
+
+    # Sort by exit timestamp (realize PnL in order)
+    closed = [t for t in all_trades if t.exit_reason not in ("OPEN_AT_END", "")]
+    closed.sort(key=lambda t: (t._exit_ts, -t.is_runner))
+
+    print(f"\n  ═══ RISK-NORMALIZED SIMULATION (Equal-Dollar Sizing) ═══")
+    print(f"  Starting Capital:    ${starting_capital:,.0f}")
+    print(f"  Allocation Per Trade:{alloc_pct}% of equity")
+    print(f"  Max Concurrent:      {max_concurrent} positions")
+    print(f"  DD Circuit Breaker:  {max_dd_breaker_pct}% of peak equity")
+    print(f"  Total trade legs:    {len(closed)}")
+
+    equity = starting_capital
+    peak_equity = starting_capital
+    trade_results = []
+    trades_taken = 0
+    trades_skipped_breaker = 0
+
+    for t in closed:
+        # Check circuit breaker
+        dd_pct = ((peak_equity - equity) / peak_equity) * 100 if peak_equity > 0 else 0
+        if dd_pct >= max_dd_breaker_pct:
+            trades_skipped_breaker += 1
+            continue
+
+        # Equal-dollar sizing: allocate fixed % of current equity
+        position_value = equity * (alloc_pct / 100)
+        # PnL in dollars = position_value * (pnl_pct / 100) * weight
+        dollar_pnl = position_value * (t.pnl_pct / 100) * t.weight
+        equity += dollar_pnl
+        if equity > peak_equity:
+            peak_equity = equity
+
+        trade_results.append({
+            'ticker': t.ticker, 'direction': t.direction,
+            'pnl_pct': t.pnl_pct, 'weight': t.weight,
+            'r_mult': t.r_multiple,
+            'equity_after': equity, 'dollar_pnl': dollar_pnl,
+            'exit_date': t.exit_date,
+        })
+        trades_taken += 1
+
+    # Final stats
+    total_return = ((equity - starting_capital) / starting_capital) * 100
+    min_equity = min(r['equity_after'] for r in trade_results) if trade_results else starting_capital
+    max_dd_dollar = peak_equity - min_equity
+    max_dd_pct_final = (max_dd_dollar / peak_equity) * 100 if peak_equity > 0 else 0
+
+    print(f"\n  ── Results ──")
+    print(f"  Trades Taken:        {trades_taken}")
+    print(f"  Skipped (breaker):   {trades_skipped_breaker}")
+    print(f"  Final Equity:        ${equity:,.0f}")
+    print(f"  Total Return:        {total_return:+.2f}%")
+    print(f"  Peak Equity:         ${peak_equity:,.0f}")
+    print(f"  Max Drawdown:        ${max_dd_dollar:,.0f} ({max_dd_pct_final:.1f}%)")
+    if trades_taken > 0:
+        print(f"  Avg $ PnL/Trade:     ${sum(r['dollar_pnl'] for r in trade_results) / trades_taken:+,.0f}")
+
+    # Equity curve milestones
+    if trade_results:
+        print(f"\n  ── Equity Curve (every 20th trade) ──")
+        print(f"  {'#':>4} {'Date':<12} {'Ticker':<8} {'Dir':<6} {'PnL%':>8} {'Wt':>4} {'$PnL':>10} {'Equity':>12} {'DD%':>6}")
+        for idx, r in enumerate(trade_results):
+            if idx % 20 == 0 or idx == len(trade_results) - 1:
+                cur_dd = ((peak_equity - r['equity_after']) / peak_equity) * 100 if peak_equity > 0 else 0
+                # Recalculate running peak for display
+                running_peak = max(starting_capital, max(tr['equity_after'] for tr in trade_results[:idx+1]))
+                cur_dd = ((running_peak - r['equity_after']) / running_peak) * 100 if running_peak > 0 else 0
+                print(f"  {idx+1:>4} {r['exit_date']:<12} {r['ticker']:<8} {r['direction']:<6} "
+                      f"{r['pnl_pct']:>+7.2f}% {r['weight']:>3.0%} "
+                      f"${r['dollar_pnl']:>+9,.0f} ${r['equity_after']:>11,.0f} {cur_dd:>5.1f}%")
+
+    # Also run without breaker for comparison
+    print(f"\n  ── Without Circuit Breaker ──")
+    equity_nb = starting_capital
+    peak_nb = starting_capital
+    min_nb = starting_capital
+    for t in closed:
+        position_value = equity_nb * (alloc_pct / 100)
+        dollar_pnl = position_value * (t.pnl_pct / 100) * t.weight
+        equity_nb += dollar_pnl
+        if equity_nb > peak_nb:
+            peak_nb = equity_nb
+        if equity_nb < min_nb:
+            min_nb = equity_nb
+
+    total_return_nb = ((equity_nb - starting_capital) / starting_capital) * 100
+    max_dd_nb = ((peak_nb - min_nb) / peak_nb) * 100 if peak_nb > 0 else 0
+    print(f"  Final Equity:        ${equity_nb:,.0f}")
+    print(f"  Total Return:        {total_return_nb:+.2f}%")
+    print(f"  Peak Equity:         ${peak_nb:,.0f}")
+    print(f"  Max Drawdown:        {max_dd_nb:.1f}%")
+
+    return trade_results
+
+
+# ═══════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1210,6 +1644,26 @@ def main():
         "--sweep",
         action="store_true",
         help="Run parameter sweep instead of single backtest",
+    )
+    parser.add_argument(
+        "--short-stop-sweep",
+        action="store_true",
+        help="Sweep SHORT stop modes (Run Peak, Trigger Bar High, ATR Based)",
+    )
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="Run walk-forward (time-split OOS) validation",
+    )
+    parser.add_argument(
+        "--risk-sim",
+        action="store_true",
+        help="Run risk-normalized equity simulation",
+    )
+    parser.add_argument(
+        "--full-analysis",
+        action="store_true",
+        help="Run all analyses: short stop sweep, walk-forward, risk sim",
     )
     args = parser.parse_args()
 
@@ -1236,6 +1690,24 @@ def main():
 
     if args.sweep:
         run_sweep(csv_files)
+        return
+
+    if args.short_stop_sweep or args.full_analysis:
+        run_short_stop_sweep(csv_files)
+        if not args.full_analysis:
+            return
+
+    if args.walk_forward or args.full_analysis:
+        run_walk_forward(csv_files, n_slices=4)
+        if not args.full_analysis:
+            return
+
+    if args.risk_sim or args.full_analysis:
+        run_risk_normalized(csv_files)
+        if not args.full_analysis:
+            return
+
+    if args.full_analysis:
         return
 
     cfg = Config()
