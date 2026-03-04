@@ -195,38 +195,93 @@ def bb_upper(closes: list, length: int, mult: float) -> float:
 
 
 def load_csv(filepath: str) -> list:
-    """Load OHLCV CSV data into Bar objects."""
+    """Load OHLCV data into Bar objects. Auto-detects format:
+       - Legacy CSV: headers time,open,high,low,close (Unix timestamps)
+       - V8 TXT: headers <TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>,<OPENINT>
+    """
     bars = []
     with open(filepath, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            ts = int(row['time'])
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            # Volume column may be 'Volume' or 'volume'
-            vol = 0.0
-            for vk in ('Volume', 'volume', 'vol'):
-                if vk in row:
+        first_line = f.readline().strip()
+        f.seek(0)
+
+        if '<TICKER>' in first_line or '<DATE>' in first_line:
+            # V8 format: angle-bracket headers, YYYYMMDD dates
+            # Strip angle brackets to get clean column names
+            clean_header = first_line.replace('<', '').replace('>', '')
+            header_line = f.readline()  # consume original header
+            fieldnames = [h.strip() for h in clean_header.split(',')]
+            reader = csv.DictReader(f, fieldnames=fieldnames)
+            for row in reader:
+                date_str = row['DATE'].strip()
+                # Parse YYYYMMDD → YYYY-MM-DD
+                iso_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                dt = datetime.strptime(date_str, '%Y%m%d').replace(tzinfo=timezone.utc)
+                ts = int(dt.timestamp())
+                vol = 0.0
+                if 'VOL' in row:
                     try:
-                        vol = float(row[vk])
+                        vol = float(row['VOL'])
                     except (ValueError, TypeError):
                         pass
-                    break
-            bars.append(Bar(
-                timestamp=ts,
-                date=dt.strftime('%Y-%m-%d'),
-                open=float(row['open']),
-                high=float(row['high']),
-                low=float(row['low']),
-                close=float(row['close']),
-                volume=vol,
-            ))
+                bars.append(Bar(
+                    timestamp=ts,
+                    date=iso_date,
+                    open=float(row['OPEN']),
+                    high=float(row['HIGH']),
+                    low=float(row['LOW']),
+                    close=float(row['CLOSE']),
+                    volume=vol,
+                ))
+        else:
+            # Legacy format: time,open,high,low,close
+            reader = csv.DictReader(f)
+            for row in reader:
+                ts = int(row['time'])
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                vol = 0.0
+                for vk in ('Volume', 'volume', 'vol'):
+                    if vk in row:
+                        try:
+                            vol = float(row[vk])
+                        except (ValueError, TypeError):
+                            pass
+                        break
+                bars.append(Bar(
+                    timestamp=ts,
+                    date=dt.strftime('%Y-%m-%d'),
+                    open=float(row['open']),
+                    high=float(row['high']),
+                    low=float(row['low']),
+                    close=float(row['close']),
+                    volume=vol,
+                ))
     return bars
 
 
+def extract_ticker_from_row(filepath: str) -> str:
+    """Extract ticker from first data row of V8 format file (e.g., 'FIZZ.US' → 'FIZZ')."""
+    with open(filepath, 'r') as f:
+        f.readline()  # skip header
+        first_data = f.readline().strip()
+        if first_data:
+            ticker_field = first_data.split(',')[0].strip()
+            # Strip country suffix like '.US'
+            if '.' in ticker_field:
+                return ticker_field.split('.')[0]
+            return ticker_field
+    return os.path.splitext(os.path.basename(filepath))[0]
+
+
 def extract_ticker(filename: str) -> str:
-    """Extract ticker symbol from filename like 'NASDAQ_AAPL, 1D (1).csv'."""
+    """Extract ticker symbol from filename.
+       Legacy: 'NASDAQ_AAPL, 1D (1).csv' → 'AAPL'
+       V8 txt: 'FIZZ.US.txt' → extracted from first data row
+    """
     base = os.path.basename(filename)
-    # Remove exchange prefix and timeframe suffix
+    # V8 txt format — extract ticker from file content
+    if base.lower().endswith('.txt'):
+        return extract_ticker_from_row(filename)
+    # Legacy CSV format
     parts = base.split(',')[0]
     if '_' in parts:
         return parts.split('_', 1)[1]
@@ -1676,9 +1731,12 @@ def main():
             print(f"  - {d}")
         sys.exit(1)
 
-    csv_files = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
+    csv_files = sorted(
+        glob.glob(os.path.join(data_dir, "**", "*.csv"), recursive=True) +
+        glob.glob(os.path.join(data_dir, "**", "*.txt"), recursive=True)
+    )
     if not csv_files:
-        print(f"ERROR: No CSV files found in {data_dir}")
+        print(f"ERROR: No data files (*.csv, *.txt) found in {data_dir} (searched recursively)")
         sys.exit(1)
 
     if args.sweep:
