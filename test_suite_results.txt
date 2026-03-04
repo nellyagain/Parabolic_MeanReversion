@@ -1,0 +1,335 @@
+====================================================================================================
+  COMPREHENSIVE BACKTEST VALIDATION SUITE — Parabolic Mean Reversion V1
+====================================================================================================
+  Data directory: synthetic_data
+  Tickers loaded: 50
+
+====================================================================================================
+  1) ENGINE CORRECTNESS TESTS
+====================================================================================================
+
+  ── 1a. No Look-Ahead Bias ──
+    Testing that indicators only use data up to decision bar...
+    [PASS] Entry prices match between full and truncated runs (2 shared trades, 0 mismatches)
+    [PASS] sma() uses values[-length:] — no future data access (structural)
+    [PASS] atr_calc() receives bars[:i+1] slice — no future data access (structural)
+
+  ── 1b. Execution Timing — Entry at Trigger Bar Close ──
+    [PASS] All non-runner entries use trigger bar close price
+
+  ── 1c. Order Precedence — Stop/Target Same-Bar Resolution ──
+    [PASS] Same-bar resolution uses dist_to_open proximity rule (deterministic)
+    Info: 43 closed trades, stop-resolved exits: 23
+
+  ── 1d. Position Accounting — PnL, Weights, Split Exits ──
+    [PASS] PnL calculations correct for all 43 trades
+    [PASS] All trade weights in (0, 1.0] range
+    [PASS] Split exit weights correct (partial=50.0%, runner=50.0%) — 14 partials, 14 runners
+
+  ── 1e. Trade Closure Invariant ──
+    [PASS] All trades closed (69 total, 0 unclosed)
+
+  ── 1f. Cooldown Between Setups ──
+    [PASS] Cooldown enforced between consecutive same-side setups
+
+====================================================================================================
+  2) STRATEGY LOGIC VALIDATION
+====================================================================================================
+
+  ── 2a. Signal Trace Audit — Random Sample of Trades ──
+    Auditing 10 randomly sampled trades:
+
+    Ticker   Dir    Entry        Exit          EntryPx   StopPx     TgtF     TgtS    PnL%      R   Ext%  Gain% Green  Crash% Reason            
+    BBBY     SHORT  2019-07-15   2019-07-22      43.71    50.37    40.33    38.88  +7.74% +0.51R +12.4% +64.1%     0   +0.0% TARGET_10MA_PARTIAL
+    ABNB     SHORT  2020-10-26   2020-10-26     281.23   310.81   276.16   254.97  +1.80% +0.17R +10.3% +53.9%     0   +0.0% TARGET_10MA_PARTIAL
+    MARA     SHORT  2019-07-08   2019-07-10     139.79   139.79   127.41   109.88 +21.40% +5.48R +27.2% +79.5%     0   +0.0% TARGET_20MA       
+    LCID     SHORT  2019-05-27   2019-05-27     153.43   168.09   147.14   120.50  +4.10% +0.43R +27.3% +86.5%     0   +0.0% TARGET_10MA_PARTIAL
+    INTC     SHORT  2020-06-08   2020-06-12      26.92    26.92    24.56    21.34  +0.00% +0.00R +26.2% +71.9%     0   +0.0% STOP_BREAKEVEN    
+    COIN     SHORT  2019-10-24   2019-10-25    2761.86  2914.30  2586.88  2357.53  +6.34% +1.15R +17.2% +51.8%     0   +0.0% TARGET_10MA_PARTIAL
+    AVGO     SHORT  2019-05-27   2019-05-31    1405.07  1405.07  1323.90  1165.51  +0.00% +0.00R +20.6% +67.0%     0   +0.0% STOP_BREAKEVEN    
+    UPST     SHORT  2020-04-23   2020-04-27     221.55   221.55   218.98   192.57  +0.00% +0.00R +15.1% +63.4%     0   +0.0% STOP_BREAKEVEN    
+    AMD      SHORT  2019-09-23   2019-09-23     157.27   166.06   135.99   127.11  -5.59% -1.00R +23.7% +56.5%     0   +0.0% STOP              
+    ORCL     SHORT  2020-12-07   2020-12-10     247.98   280.03   252.12   214.24 -12.92% -1.00R +15.7% +94.7%     0   +0.0% STOP              
+    [PASS] All SHORT stops above entry price
+    [PASS] All LONG stops below entry price
+
+  ── 2b. Reproducibility — Same Data → Same Trades ──
+    [PASS] Two runs produce identical results (43 trades)
+
+  ── 2c. Edge Decomposition — SHORT-only vs LONG-only Performance ──
+
+    Metric                 SHORT-only    LONG-only     Combined
+    -------------------- ------------ ------------ ------------
+    Trade Legs                    289            3          292
+    Win Rate %                   43.9         25.0         43.8
+    Avg PnL %                    0.96        -2.38         0.92
+    Profit Factor                1.29         0.38         1.28
+    Cum PnL %                   182.3         -4.8        177.6
+    Max DD %                    138.5          7.7        138.0
+    Avg R-Multiple               0.13        -0.39         0.12
+    [PASS] SHORT PF is finite (1.29)
+    [PASS] LONG PF is finite (0.38)
+
+  ── 2d. Distribution Checks — Winners/Losers, Tail Contribution ──
+    Total closed trades:    292
+    Mean PnL:               +0.61%
+    Median PnL:             +1.20%
+    Std Dev PnL:            6.23%
+    Skewness:               -0.48
+    Top 5 trades share:     8.8% of gross profit
+    Top 10 trades share:    15.7% of gross profit
+
+    Holding period: mean=3.8, median=3, max=22, min=1
+
+====================================================================================================
+  3) OUT-OF-SAMPLE PROTOCOL
+====================================================================================================
+
+  ── 3a. 3-Way Time Split — Train (60%) / Validate (20%) / Test (20%) ──
+    Train:    ... → 2020-06-18
+    Validate: 2020-06-18 → 2021-04-13
+    Test:     2021-04-13 → ...
+
+    Period        Trades     WR%   AvgPnL      PF    CumPnL   MaxDD
+    Train            198   46.1%   +1.55%   1.53   +198.6%   75.9%
+    Validate          71   32.7%   -1.64%   0.65    -80.2%  138.0%
+    Test              23   60.0%   +3.94%   3.46    +59.2%   12.7%
+    [PASS] Test set held out (never used for parameter tuning) — 23 trades
+
+  ── 3b. Walk-Forward — 5 Rolling OOS Windows ──
+
+    Window Period                     Trades     WR%   AvgPnL      PF    CumPnL
+         1 2018-01-02 → 2018-10-28          33   55.0%   +3.14%   2.45    +62.7%
+         2 2018-10-28 → 2019-08-23          70   31.6%   -1.09%   0.73    -53.4%
+         3 2019-08-23 → 2020-06-18          95   55.1%   +3.21%   2.41   +189.3%
+         4 2020-06-18 → 2021-04-13          71   32.7%   -1.64%   0.65    -80.2%
+         5 2021-04-13 → 2022-02-07          23   60.0%   +3.94%   3.46    +59.2%
+    [PASS] Walk-forward: 3/5 windows profitable
+
+  ── 3c. Purged Split — 5-Bar Embargo Between Train and OOS ──
+    Train (pre-purge):  144 trades, PF=1.25, WR=41.1%
+    Test (post-embargo):146 trades, PF=1.34, WR=46.6%
+    [PASS] Purged/embargoed split prevents train-test leakage
+
+====================================================================================================
+  4) ROBUSTNESS TESTS
+====================================================================================================
+
+  ── 4a. Universe Expansion — Full 50-Ticker Run ──
+    Full universe: 50 tickers, 292 trades, PF=1.28, WR=43.8%
+
+  ── 4b. Out-of-Universe — Large-Cap vs Small-Cap vs Mid-Cap ──
+
+    Segment       Tickers  Trades     WR%   AvgPnL      PF    CumPnL   MaxDD
+    Large-Cap          20     153   44.5%   +1.33%   1.45   +132.7%   81.8%
+    Mid-Cap             9      72   37.2%   -0.17%   0.96     -7.9%   76.6%
+    Small-Cap          21      67   48.9%   +1.17%   1.34    +52.8%   84.7%
+
+  ── 4c. Parameter Perturbation — Jitter ±10-25% ──
+
+    Parameter                  Base Jittered  Base PF   Jit PF  Delta PF  Smooth?
+    largecap_gain_pct          40.0    42.79    1.24    1.23    +0.02      YES
+    min_ext_above_ma           20.0    15.25    1.24    1.12    +0.12      YES
+    min_crash_pct              30.0    26.63    1.24    1.24    +0.00      YES
+    crash_window                 15       13    1.24    1.24    +0.00      YES
+    gain_lookback                20       22    1.24    1.24    +0.00      YES
+    min_green_days                3        3    1.24    1.24    +0.00      YES
+    atr_mult                    1.0      1.2    1.24    1.24    +0.00      YES
+    max_stop_vs_adr             1.5     1.19    1.24    1.08    +0.17      YES
+    short_setup_timeout          10       10    1.24    1.24    +0.00      YES
+    cooldown_bars                 3        2    1.24    1.24    +0.00      YES
+    [PASS] Parameter sensitivity: 0/10 cliff edges
+
+  ── 4d. Feature Ablation — Remove One Module at a Time ──
+
+    Ablation                  Trades     WR%   AvgPnL      PF    CumPnL  vs Base
+    No Cooldown                  301   43.9%   +0.90%   1.28   +178.1%   -0.00
+    No ADR Stop Cap              540   52.0%   +1.28%   1.43   +441.3%   +0.14
+    No Split Exit                192   56.2%   +0.34%   1.10    +65.7%   -0.18
+    No Min Green Days            398   44.0%   +0.99%   1.33   +255.9%   +0.04
+    No Extension Filter          438   45.2%   +0.53%   1.16   +152.3%   -0.12
+    No Prior Run Gate            295   43.8%   +1.00%   1.31   +194.0%   +0.02
+    No Velocity Gate             293   43.5%   +0.86%   1.26   +165.9%   -0.02
+    No Selling Climax            519   41.5%   +0.26%   1.05    +92.3%   -0.23
+
+====================================================================================================
+  5) EXECUTION REALISM / FRICTION TESTS
+====================================================================================================
+
+  ── 5a. ATR-Based Spread/Slippage Model ──
+    Flat slippage model (bps):
+      Slippage  Adj WR%   Adj PF  Adj CumPnL
+           0bp    43.8%    1.28     +177.6%
+           5bp    43.8%    1.25     +158.4%
+          10bp    43.8%    1.21     +139.2%
+          20bp    43.8%    1.15     +100.8%
+          50bp    42.7%    0.98      -14.4%
+
+  ── 5b. Gap-Through-Stop Penalty ──
+     GapPenalty%   Adj PF  Adj CumPnL  Avg Loss
+            0.0%    1.28     +177.6%    -5.81%
+            0.5%    1.20     +135.6%    -6.20%
+            1.0%    1.13      +93.6%    -6.59%
+            2.0%    1.01       +9.6%    -7.37%
+
+  ── 5c. Short-Specific Friction — Borrow Fees + HTB No-Fill ──
+     BorrowRate%  ShortPF  ShortCumPnL
+            0.0%    1.29      +182.3%
+            1.0%    1.29      +182.3%
+            3.0%    1.29      +182.3%
+           10.0%    1.29      +182.1%
+           25.0%    1.29      +181.6%
+
+    HTB no-fill simulation:
+      NoFillProb  TradesTaken  ShortPF  ShortCumPnL
+             0%          289    1.29      +182.3%
+             5%          274    1.24      +147.3%
+            10%          265    1.31      +180.4%
+            20%          229    1.41      +192.7%
+            50%          140    1.25       +74.5%
+
+  ── 5d. Liquidity Impact — Position Size Cap ──
+    (Simulated: reject trades where notional > X% of ADV)
+     ADV Cap %  Trades      PF    CumPnL
+        100.0%     292   1.28   +177.6%
+          5.0%     292   1.28   +177.6%
+          2.0%     241   1.18    +96.5%
+          1.0%     214   1.06    +28.2%
+          0.5%     200   1.04    +18.4%
+
+====================================================================================================
+  6) PORTFOLIO-LEVEL RISK TESTS
+====================================================================================================
+
+  ── 6a. Time in Market / Exposure ──
+    Total bar-days in trades: 1118
+    Total available bar-days: 60214
+    Exposure:                 1.86%
+    Cum PnL:                  +177.6%
+    Return per unit exposure: +95.65
+
+  ── 6b. Drawdown Anatomy ──
+    Number of drawdowns:      10
+    Max drawdown:             78.31%
+    Average drawdown:         21.04%
+    Avg drawdown length:      17.1 trades
+    Ulcer Index:              45.01
+
+  ── 6c. Streak Risk — Losing Streaks ──
+    Max losing streak:        6
+    Max winning streak:       8
+    Max trades to new high:   92
+    Equity new highs:         39
+    Monthly win rate:         56.8% (25/44 months)
+
+  ── 6d. Tail Metrics — Worst Periods ──
+    Worst month PnL:          -30.95%
+    5th percentile month:     -25.01%
+    CVaR (5%):                -27.29%
+    Worst single trade:       -23.84%
+    Worst 3 trades combined:  -53.20%
+
+====================================================================================================
+  7) STATISTICAL CONFIDENCE TESTS
+====================================================================================================
+
+  ── 7a. Bootstrap — Confidence Intervals for Key Metrics ──
+    5000 bootstrap resamples of 292 trades:
+
+    Metric               Mean   95% CI Low  95% CI High
+    ---------------- -------- ------------ ------------
+    Profit Factor        1.30         0.96         1.75
+    Win Rate %           43.8         38.1         49.9
+    Avg PnL %           +0.94        -0.15        +2.08
+    Cum PnL %          +178.8        -30.2       +389.8
+    [FAIL] Bootstrap 95% CI: PF lower bound = 0.96 < 1.0
+
+  ── 7b. Monte Carlo — Randomized Trade Order/Returns ──
+
+    Monte Carlo path simulation (10000 runs):
+    P(return < 0):         0.0%
+    P(return < -10%):      0.0%
+    P(MaxDD >  5%):       100.0%
+    P(MaxDD > 10%):       100.0%
+    P(MaxDD > 15%):       100.0%
+    P(MaxDD > 20%):       100.0%
+    P(MaxDD > 30%):       100.0%
+    Expected MaxDD:        73.6%
+    95th pctile MaxDD:     111.8%
+    99th pctile MaxDD:     133.5%
+
+  ── 7c. Reality Check — Minimum Trades for Positive Edge ──
+    Observed mean PnL:      +0.61%
+    Observed std PnL:       6.24%
+    Current sample size:    292
+    Min trades for 95% CI:  405
+    [FAIL] Sample size insufficient (292 vs 405 needed)
+
+====================================================================================================
+  8) REGIME AND CONDITIONAL PERFORMANCE
+====================================================================================================
+
+  ── 8a. Market Trend — Index Above/Below 200D MA ──
+
+    Regime                Trades     WR%   AvgPnL      PF    CumPnL
+    Above 200D MA            235   41.9%   +0.64%   1.19   +100.0%
+    Below 200D MA             34   54.5%   +2.76%   1.91    +60.7%
+
+  ── 8b. Volatility Regime — Realized Vol Bands ──
+
+    Vol Regime            Trades     WR%   AvgPnL      PF    CumPnL
+    Low (<15%)                32   34.9%   -0.13%   0.96     -2.8%
+    Medium (15-25%)          116   44.5%   +1.28%   1.42    +99.2%
+    High (>25%)              144   45.2%   +0.87%   1.25    +81.2%
+
+  ── 8c. Annual Performance ──
+
+    Year    Trades     WR%   AvgPnL      PF    CumPnL
+    2018        50   43.8%   +1.06%   1.40    +33.9%
+    2019        91   40.3%   +0.83%   1.24    +51.7%
+    2020        99   42.3%   +0.17%   1.05    +11.2%
+    2021        52   53.0%   +2.45%   1.84    +80.7%
+
+  ── 8d. Direction x Regime Cross-Tab ──
+
+    SHORT:
+      Low Vol         32 trades, PF=0.96, WR=34.9%, AvgPnL=-0.13%
+      Med Vol        113 trades, PF=1.45, WR=45.0%, AvgPnL=+1.38%
+      High Vol       144 trades, PF=1.25, WR=45.2%, AvgPnL=+0.87%
+
+    LONG:
+      Med Vol          3 trades, PF=0.38, WR=25.0%, AvgPnL=-2.38%
+
+====================================================================================================
+  9) FORWARD TEST — HOLD-OUT PERIOD
+====================================================================================================
+
+  ── In-Sample vs Forward (cutoff: 2021-04-13) ──
+
+    Period            Trades     WR%   AvgPnL      PF    CumPnL   MaxDD    AvgR
+    In-Sample            269   42.4%   +0.67%   1.20   +118.4%  138.0%  +0.10R
+    Forward Test          23   60.0%   +3.94%   3.46    +59.2%   12.7%  +0.43R
+
+    PF degradation:      -189.0%
+    WR degradation:      -17.6pp
+    [PASS] Forward performance acceptable (PF: 1.20 → 3.46)
+
+  ── Walk-Forward Rolling (5 windows, fixed rules) ──
+
+    Window Period                     Trades     WR%   AvgPnL      PF
+         1 2018-01-02 → 2018-10-28          33   55.0%   +3.14%   2.45
+         2 2018-10-28 → 2019-08-23          70   31.6%   -1.09%   0.73
+         3 2019-08-23 → 2020-06-18          95   55.1%   +3.21%   2.41
+         4 2020-06-18 → 2021-04-13          71   32.7%   -1.64%   0.65
+         5 2021-04-13 → 2022-02-07          23   60.0%   +3.94%   3.46
+
+====================================================================================================
+  FINAL SUMMARY
+====================================================================================================
+
+  Tests passed: 20/22
+  Tests failed: 2/22
+
+  OVERALL VERDICT: MOSTLY PASSING — 2 test(s) need attention
+
+====================================================================================================
