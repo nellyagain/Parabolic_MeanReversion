@@ -88,8 +88,12 @@ class Config:
     # Gap exclusion
     gap_exclusion_atr_mult: float = 2.0
 
+    # ── V8: SHORT minimum reward filter ──
+    short_min_reward_pct: float = 3.0     # V8: only short if 10MA target >= 3% below entry
+
     # ── LONG side — Stop Management ──
     long_stop_cap_atr_mult: float = 2.0   # V6: cap structural stop at 2x ATR from entry
+    long_max_stop_pct: float = 20.0       # V8: hard-cap LONG stop at 20% from entry (clips worst outliers)
     # ── LONG side — Exit Model ──
     long_exit_mode: str = "v5_hybrid"  # "v5_hybrid" or "v4_legacy"
     long_r1_target: float = 1.5
@@ -142,6 +146,11 @@ class Config:
     stop_buffer: float = 0.2
     atr_len: int = 14
     atr_mult: float = 1.0
+    max_loss_pct: float = 0.0            # V8: disabled (conflicts with stop logic, causes worse fills)
+
+    # ── V8: Per-ticker LONG cooldown ──
+    long_ticker_cooldown: bool = True     # V8: skip LONG on a ticker after N consecutive stops
+    long_ticker_max_consec_stops: int = 3 # V8: number of consecutive LONG stops before cooldown
 
     # ── Timeouts & Cooldown ──
     short_setup_timeout: int = 10
@@ -153,6 +162,17 @@ class Config:
     max_trade_bars: int = 50
     # ── Forward test ──
     forward_test_date: str = "2023-01-01"  # V6: fixed calendar cutoff for all tickers
+    # ── V8: Additional data directories ──
+    extra_data_dirs: list = None  # V8: list of additional data directories to scan
+
+    # ── V8: Portfolio Simulation ──
+    portfolio_start_capital: float = 100_000.0
+    portfolio_risk_per_trade: float = 2.0     # % of equity risked per trade
+    portfolio_max_positions: int = 6          # max concurrent open positions
+    portfolio_max_per_ticker: int = 2         # max concurrent positions per ticker
+    portfolio_max_ticker_alloc: float = 25.0  # max % of equity in one ticker
+    portfolio_slippage_pct: float = 0.10      # slippage per fill (% of price)
+    portfolio_commission_per_fill: float = 1.0  # flat fee per fill (entry + exit = 2 fills)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -412,6 +432,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
     # V6: SHORT circuit breaker — track recent SHORT trade results
     recent_short_results = []  # list of pnl_pct for last N SHORT trades
     short_circuit_active = False  # True when circuit breaker is tripped
+    # V8: Per-ticker LONG consecutive stop tracker
+    long_ticker_consec_stops = {}  # ticker -> count of consecutive LONG stops
 
     # LONG state machine — V6 dual-channel (fast path + base breakout)
     # Fast path state (Channel A)
@@ -481,6 +503,21 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 continue
 
             if t.direction == "SHORT":
+                # V8: Hard max loss cap — force exit if unrealized loss exceeds max_loss_pct
+                unrealized_short_pnl = ((t.entry_price - bar.close) / t.entry_price) * 100 if t.entry_price > 0 else 0
+                if cfg.max_loss_pct > 0 and unrealized_short_pnl < -cfg.max_loss_pct:
+                    t.exit_bar = i
+                    t.exit_date = bar.date
+                    t.exit_price = bar.close
+                    t.exit_reason = "MAX_LOSS"
+                    t.pnl_pct = unrealized_short_pnl
+                    t.bars_held = bars_held
+                    if t.risk_pct > 0:
+                        t.r_multiple = t.pnl_pct / t.risk_pct
+                    if not t.is_runner:
+                        recent_short_results.append(t.pnl_pct)
+                    continue
+
                 # V6 SHORT exit: no runner, full exit at 10MA, SHORT-specific time stop
                 stop_hit = bar.high >= t.stop_price
                 tgt_fast_hit = not t.is_runner and bar.low <= t.target_fast and t.target_fast < t.entry_price
@@ -545,6 +582,22 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     continue
 
             elif t.direction == "LONG":
+                # V8: Hard max loss cap for LONG trades
+                unrealized_long_pnl = ((bar.close - t.entry_price) / t.entry_price) * 100 if t.entry_price > 0 else 0
+                if cfg.max_loss_pct > 0 and unrealized_long_pnl < -cfg.max_loss_pct and t.partial_stage < 1:
+                    t.exit_bar = i
+                    t.exit_date = bar.date
+                    t.exit_price = bar.close
+                    t.exit_reason = "MAX_LOSS"
+                    t.pnl_pct = unrealized_long_pnl
+                    t.bars_held = bars_held
+                    if t.risk_pct > 0:
+                        t.r_multiple = t.pnl_pct / t.risk_pct
+                    # V8: Track consecutive LONG stops per ticker
+                    if not t.is_runner:
+                        long_ticker_consec_stops[ticker] = long_ticker_consec_stops.get(ticker, 0) + 1
+                    continue
+
                 # V5 LONG exit logic
                 if cfg.long_exit_mode == "v5_hybrid" and t.r_unit > 0:
                     # Update trailing stop
@@ -584,6 +637,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                             t.exit_reason = "STOP_BREAKEVEN"
                         else:
                             t.exit_reason = "STOP"
+                            # V8: Track consecutive LONG stops per ticker
+                            long_ticker_consec_stops[ticker] = long_ticker_consec_stops.get(ticker, 0) + 1
                         t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
                         t.bars_held = bars_held
                         if t.risk_pct > 0:
@@ -599,6 +654,8 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                         t.weight = cfg.long_partial_pct / 100.0
                         if t.risk_pct > 0:
                             t.r_multiple = t.pnl_pct / t.risk_pct
+                        # V8: Reset consecutive stop counter — trade won
+                        long_ticker_consec_stops[ticker] = 0
                         # Create runner for R2
                         runner = Trade(
                             ticker=t.ticker, direction="LONG",
@@ -951,24 +1008,30 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 ts_val = sma(closes, cfg.target_ma_slow)
                 risk_pct = ((short_stop - bar.close) / bar.close) * 100 if bar.close > 0 else 0.0
 
-                trade = Trade(
-                    ticker=ticker, direction="SHORT",
-                    entry_bar=i, entry_date=bar.date,
-                    entry_price=bar.close, stop_price=short_stop,
-                    target_fast=tf, target_slow=ts_val,
-                    extension_pct=extension_pct,
-                    rolling_gain_pct=rolling_gain_pct,
-                    green_streak=green_streak,
-                    risk_pct=risk_pct,
-                )
-                trades.append(trade)
-                open_trades.append(trade)
+                # V8: SHORT minimum reward filter — 10MA target must be >= N% below entry
+                short_reward_pct = ((bar.close - tf) / bar.close) * 100 if bar.close > 0 and tf < bar.close else 0.0
+                if short_reward_pct < cfg.short_min_reward_pct:
+                    short_setup_triggered = False
 
-                short_setup_active = False
-                last_short_bar = i
-                short_avwap_num = 0.0
-                short_avwap_den = 0.0
-                short_run_avwap = 0.0
+                if short_setup_triggered:
+                    trade = Trade(
+                        ticker=ticker, direction="SHORT",
+                        entry_bar=i, entry_date=bar.date,
+                        entry_price=bar.close, stop_price=short_stop,
+                        target_fast=tf, target_slow=ts_val,
+                        extension_pct=extension_pct,
+                        rolling_gain_pct=rolling_gain_pct,
+                        green_streak=green_streak,
+                        risk_pct=risk_pct,
+                    )
+                    trades.append(trade)
+                    open_trades.append(trade)
+
+                    short_setup_active = False
+                    last_short_bar = i
+                    short_avwap_num = 0.0
+                    short_avwap_den = 0.0
+                    short_run_avwap = 0.0
 
         if short_setup_active and (i - short_setup_bar > cfg.short_setup_timeout):
             short_setup_active = False
@@ -1014,30 +1077,46 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 long_stop = max(long_stop, struct_stop, atr_cap)
 
                 risk_pct = ((bar.close - long_stop) / bar.close) * 100 if bar.close > 0 else 0.0
-                r_unit = bar.close - long_stop
 
-                target_r1 = bar.close + (r_unit * cfg.long_r1_target) if r_unit > 0 else 0.0
-                target_r2 = bar.close + (r_unit * cfg.long_r2_target) if r_unit > 0 else 0.0
-                tf = sma(closes, cfg.target_ma_fast)
-                ts_val = sma(closes, cfg.target_ma_slow)
+                # V8: Hard-cap LONG stop at max_loss_pct from entry
+                if cfg.long_max_stop_pct > 0 and risk_pct > cfg.long_max_stop_pct and bar.close > 0:
+                    long_stop = bar.close * (1 - cfg.long_max_stop_pct / 100.0)
+                    risk_pct = cfg.long_max_stop_pct
 
-                trade = Trade(
-                    ticker=ticker, direction="LONG",
-                    entry_bar=i, entry_date=bar.date,
-                    entry_price=bar.close, stop_price=long_stop,
-                    target_fast=tf, target_slow=ts_val,
-                    crash_from_peak=long_fast_crash_pct,
-                    risk_pct=risk_pct,
-                    base_duration=i - long_fast_bar,
-                    r_unit=r_unit,
-                    target_r1_price=target_r1,
-                    target_r2_price=target_r2,
-                )
-                trades.append(trade)
-                open_trades.append(trade)
+                # V8: Per-ticker LONG cooldown check
+                ticker_cooldown_ok = True
+                if cfg.long_ticker_cooldown:
+                    consec = long_ticker_consec_stops.get(ticker, 0)
+                    if consec >= cfg.long_ticker_max_consec_stops:
+                        ticker_cooldown_ok = False
 
-                long_fast_active = False
-                last_long_bar = i
+                if not ticker_cooldown_ok:
+                    long_fast_active = False
+                else:
+                    r_unit = bar.close - long_stop
+
+                    target_r1 = bar.close + (r_unit * cfg.long_r1_target) if r_unit > 0 else 0.0
+                    target_r2 = bar.close + (r_unit * cfg.long_r2_target) if r_unit > 0 else 0.0
+                    tf = sma(closes, cfg.target_ma_fast)
+                    ts_val = sma(closes, cfg.target_ma_slow)
+
+                    trade = Trade(
+                        ticker=ticker, direction="LONG",
+                        entry_bar=i, entry_date=bar.date,
+                        entry_price=bar.close, stop_price=long_stop,
+                        target_fast=tf, target_slow=ts_val,
+                        crash_from_peak=long_fast_crash_pct,
+                        risk_pct=risk_pct,
+                        base_duration=i - long_fast_bar,
+                        r_unit=r_unit,
+                        target_r1_price=target_r1,
+                        target_r2_price=target_r2,
+                    )
+                    trades.append(trade)
+                    open_trades.append(trade)
+
+                    long_fast_active = False
+                    last_long_bar = i
 
         # Fast path timeout
         if long_fast_active and (i - long_fast_bar > cfg.long_setup_timeout):
@@ -1249,40 +1328,56 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 long_stop = max(long_stop, atr_cap_stop)
 
                 risk_pct = ((bar.close - long_stop) / bar.close) * 100 if bar.close > 0 else 0.0
-                r_unit = bar.close - long_stop
 
-                # R-based targets
-                target_r1 = bar.close + (r_unit * cfg.long_r1_target) if r_unit > 0 else 0.0
-                target_r2 = bar.close + (r_unit * cfg.long_r2_target) if r_unit > 0 else 0.0
+                # V8: Hard-cap LONG stop at max_loss_pct from entry
+                if cfg.long_max_stop_pct > 0 and risk_pct > cfg.long_max_stop_pct and bar.close > 0:
+                    long_stop = bar.close * (1 - cfg.long_max_stop_pct / 100.0)
+                    risk_pct = cfg.long_max_stop_pct
 
-                tf = sma(closes, cfg.target_ma_fast)
-                ts_val = sma(closes, cfg.target_ma_slow)
-                bars_in_base = i - long_crash_bar
+                # V8: Per-ticker LONG cooldown check
+                ticker_cooldown_ok = True
+                if cfg.long_ticker_cooldown:
+                    consec = long_ticker_consec_stops.get(ticker, 0)
+                    if consec >= cfg.long_ticker_max_consec_stops:
+                        ticker_cooldown_ok = False
 
-                trade = Trade(
-                    ticker=ticker, direction="LONG",
-                    entry_bar=i, entry_date=bar.date,
-                    entry_price=bar.close, stop_price=long_stop,
-                    target_fast=tf, target_slow=ts_val,
-                    crash_from_peak=crash_from_peak,
-                    risk_pct=risk_pct,
-                    base_duration=bars_in_base,
-                    absorption_score=abs_score,
-                    spring_detected=long_spring_detected,
-                    breakout_rvol=rvol_median,
-                    atr_contraction=atr_contraction,
-                    r_unit=r_unit,
-                    target_r1_price=target_r1,
-                    target_r2_price=target_r2,
-                )
-                trades.append(trade)
-                open_trades.append(trade)
+                if not ticker_cooldown_ok:
+                    long_phase = LONG_IDLE
+                else:
+                    r_unit = bar.close - long_stop
 
-                # Reset
-                long_phase = LONG_IDLE
-                last_long_bar = i
-                long_crash_bars_slice = []
-                long_crash_vols_slice = []
+                    # R-based targets
+                    target_r1 = bar.close + (r_unit * cfg.long_r1_target) if r_unit > 0 else 0.0
+                    target_r2 = bar.close + (r_unit * cfg.long_r2_target) if r_unit > 0 else 0.0
+
+                    tf = sma(closes, cfg.target_ma_fast)
+                    ts_val = sma(closes, cfg.target_ma_slow)
+                    bars_in_base = i - long_crash_bar
+
+                    trade = Trade(
+                        ticker=ticker, direction="LONG",
+                        entry_bar=i, entry_date=bar.date,
+                        entry_price=bar.close, stop_price=long_stop,
+                        target_fast=tf, target_slow=ts_val,
+                        crash_from_peak=crash_from_peak,
+                        risk_pct=risk_pct,
+                        base_duration=bars_in_base,
+                        absorption_score=abs_score,
+                        spring_detected=long_spring_detected,
+                        breakout_rvol=rvol_median,
+                        atr_contraction=atr_contraction,
+                        r_unit=r_unit,
+                        target_r1_price=target_r1,
+                        target_r2_price=target_r2,
+                    )
+                    trades.append(trade)
+                    open_trades.append(trade)
+
+                    # Reset
+                    long_phase = LONG_IDLE
+                    last_long_bar = i
+                    long_crash_bars_slice = []
+                    long_crash_vols_slice = []
 
             # Still check for breakdown (lost base) or timeout
             bars_since_ready = i - long_phase_bar
@@ -1407,6 +1502,7 @@ def print_grand_summary(all_trades: list, label: str = "V5 HYBRID"):
     r2_exits = [t for t in closed if t.exit_reason == "TARGET_R2"]
     trail_exits = [t for t in closed if t.exit_reason == "TRAIL_STOP"]
     time_stops = [t for t in closed if t.exit_reason == "TIME_STOP"]
+    max_loss_exits = [t for t in closed if t.exit_reason == "MAX_LOSS"]
 
     # Profit factor
     gross_profit = sum(t.pnl_pct * t.weight for t in wins) if wins else 0
@@ -1482,6 +1578,7 @@ def print_grand_summary(all_trades: list, label: str = "V5 HYBRID"):
     _reason_line("TARGET_R2:", r2_exits)
     _reason_line("TRAIL_STOP:", trail_exits)
     _reason_line("TIME_STOP:", time_stops)
+    _reason_line("MAX_LOSS:", max_loss_exits)
 
     print(f"\n  ── Extremes ──")
     print(f"  Best Trade:   {best.ticker} {best.direction} {best.entry_date} → {best.exit_date}  PnL: {best.pnl_pct:+.2f}% x{best.weight:.0%}  ({best.exit_reason})")
@@ -1540,6 +1637,67 @@ def print_grand_summary(all_trades: list, label: str = "V5 HYBRID"):
         print(f"  Avg Absorption Score:    {avg_abs:.3f}")
         print(f"  Spring Detected:         {spring_pct:.1f}%")
         print(f"  Avg Breakout RVOL:       {avg_bvol:.2f}x")
+
+    # ── V8: Risk-Normalized Performance ──
+    # Simulate 2% portfolio risk per trade: position_size = 2% / risk_pct
+    risk_target = 2.0  # % portfolio risk per trade
+    rn_trades = [t for t in closed if t.risk_pct > 0]
+    if rn_trades:
+        rn_pnls = []
+        for t in rn_trades:
+            pos_size = min(risk_target / t.risk_pct, 1.0)  # cap at 100% position
+            rn_pnl = t.pnl_pct * t.weight * pos_size
+            rn_pnls.append(rn_pnl)
+        rn_total = sum(rn_pnls)
+        rn_wins = [p for p in rn_pnls if p > 0]
+        rn_losses = [p for p in rn_pnls if p <= 0]
+        rn_gross_profit = sum(rn_wins) if rn_wins else 0
+        rn_gross_loss = abs(sum(rn_losses)) if rn_losses else 0
+        rn_pf = rn_gross_profit / rn_gross_loss if rn_gross_loss > 0 else float('inf')
+
+        # Risk-normalized drawdown
+        rn_cum = 0.0
+        rn_peak = 0.0
+        rn_max_dd = 0.0
+        for p in rn_pnls:
+            rn_cum += p
+            if rn_cum > rn_peak:
+                rn_peak = rn_cum
+            dd = rn_peak - rn_cum
+            if dd > rn_max_dd:
+                rn_max_dd = dd
+
+        print(f"\n  ── Risk-Normalized Performance (2% risk/trade) ──")
+        print(f"  Cumulative PnL:          {rn_total:+.2f}% (portfolio terms)")
+        print(f"  Profit Factor:           {rn_pf:.2f}")
+        print(f"  Max Drawdown:            {rn_max_dd:.2f}% (portfolio terms)")
+        print(f"  Avg PnL per Trade:       {rn_total / len(rn_pnls):+.2f}%")
+        print(f"  Worst Single Trade:      {min(rn_pnls):+.2f}%")
+
+    # ── V8: Concentration Analysis ──
+    ticker_pnls = {}
+    for t in closed:
+        ticker_pnls.setdefault(t.ticker, 0.0)
+        ticker_pnls[t.ticker] += t.pnl_pct * t.weight
+    sorted_tickers = sorted(ticker_pnls.items(), key=lambda x: x[1], reverse=True)
+
+    if sorted_tickers and total_pnl != 0:
+        top1_tkr, top1_pnl = sorted_tickers[0]
+        top2_tkr, top2_pnl = sorted_tickers[1] if len(sorted_tickers) > 1 else ("", 0)
+        top1_pct = top1_pnl / total_pnl * 100 if total_pnl > 0 else 0
+        top2_pct = (top1_pnl + top2_pnl) / total_pnl * 100 if total_pnl > 0 else 0
+        ex_top1_pnl = total_pnl - top1_pnl
+        ex_top2_pnl = total_pnl - top1_pnl - top2_pnl
+
+        print(f"\n  ── Concentration Analysis ──")
+        print(f"  Top Contributor:         {top1_tkr} = {top1_pnl:+.2f}% ({top1_pct:.1f}% of total PnL)")
+        print(f"  Top 2 Contributors:      {top1_tkr}+{top2_tkr} = {top1_pnl + top2_pnl:+.2f}% ({top2_pct:.1f}% of total PnL)")
+        print(f"  Ex-Top-1 PnL:            {ex_top1_pnl:+.2f}%")
+        print(f"  Ex-Top-2 PnL:            {ex_top2_pnl:+.2f}%")
+        n_profitable_tickers = sum(1 for _, p in sorted_tickers if p > 0)
+        n_losing_tickers = sum(1 for _, p in sorted_tickers if p <= 0)
+        print(f"  Profitable Tickers:      {n_profitable_tickers}/{len(sorted_tickers)} ({n_profitable_tickers / len(sorted_tickers) * 100:.0f}%)")
+        print(f"  Losing Tickers:          {n_losing_tickers}/{len(sorted_tickers)}")
 
     # Complete trade log
     print(f"\n  ── Complete Trade Log ({len(closed)} legs from {n_setups} setups) ──")
@@ -1692,16 +1850,443 @@ def run_walk_forward(csv_files: list, n_slices: int = 4, cfg: Config = None):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# PORTFOLIO SIMULATION — V8
+# Realistic single-portfolio with compounding, concurrency, slippage,
+# fees, overlap handling, and concentration limits.
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class PortfolioFill:
+    """Record of a portfolio-level trade execution."""
+    trade: object  # Trade reference
+    shares: float
+    entry_fill: float   # actual entry price after slippage
+    exit_fill: float    # actual exit price after slippage
+    position_value: float  # dollar value at entry
+    pnl_dollar: float
+    pnl_pct_portfolio: float  # pnl as % of equity at entry
+    equity_at_entry: float
+    fees: float
+
+
+def run_portfolio_simulation(all_trades, cfg, label="Portfolio Sim"):
+    """
+    Simulate a real portfolio with:
+    - Compounding equity
+    - Risk-based position sizing (cfg.portfolio_risk_per_trade % of equity per trade)
+    - Max concurrent positions (cfg.portfolio_max_positions)
+    - Per-ticker concentration cap (cfg.portfolio_max_per_ticker, cfg.portfolio_max_ticker_alloc)
+    - Slippage on every fill (cfg.portfolio_slippage_pct)
+    - Commission on every fill (cfg.portfolio_commission_per_fill)
+    - Overlap handling (trades sorted by entry_bar, exits processed first)
+    """
+    start_capital = cfg.portfolio_start_capital
+    risk_pct = cfg.portfolio_risk_per_trade
+    max_pos = cfg.portfolio_max_positions
+    max_per_ticker = cfg.portfolio_max_per_ticker
+    max_ticker_alloc = cfg.portfolio_max_ticker_alloc / 100.0
+    slip_pct = cfg.portfolio_slippage_pct / 100.0
+    comm = cfg.portfolio_commission_per_fill
+
+    # Filter to original setups only (no runner legs — they're part of the parent position)
+    # But we need runner legs for partial exits. Group by (ticker, entry_bar, entry_date)
+    # and treat each setup + its runners as one position.
+
+    # Build position groups: each original entry + its runner legs
+    closed = [t for t in all_trades if t.exit_bar >= 0 and t.exit_reason not in ("OPEN_AT_END", "")]
+    if not closed:
+        print(f"\n  No closed trades for portfolio simulation.")
+        return
+
+    # Group trades into positions: (ticker, entry_date, entry_price) → list of legs
+    from collections import defaultdict
+    position_groups = defaultdict(list)
+    for t in closed:
+        key = (t.ticker, t.entry_date, t.entry_price)
+        position_groups[key].append(t)
+
+    # Build event timeline: (bar_index, event_type, position_key, leg)
+    # event_type: 'exit' processed before 'entry' on same bar
+    events = []
+    for key, legs in position_groups.items():
+        # Entry event on the first leg's entry_bar
+        first_leg = legs[0]
+        events.append((first_leg.entry_bar, 1, 'entry', key, first_leg))  # 1 = entry sort order
+        # Exit events for each leg
+        for leg in legs:
+            events.append((leg.exit_bar, 0, 'exit', key, leg))  # 0 = exit sort order (before entry)
+
+    # Sort: by bar, then exits before entries
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    # Portfolio state
+    equity = start_capital
+    peak_equity = start_capital
+    max_dd_pct = 0.0
+    max_dd_dollar = 0.0
+
+    # Open positions: key → {shares, entry_fill, equity_at_entry, remaining_weight, legs_filled}
+    open_positions = {}
+    fills = []
+    equity_curve = [(0, equity)]  # (bar, equity)
+
+    # Track per-ticker exposure
+    ticker_open_count = defaultdict(int)  # ticker → count of open positions
+    ticker_open_value = defaultdict(float)  # ticker → total dollar value open
+
+    skipped_capacity = 0
+    skipped_concentration = 0
+    skipped_capital = 0
+    total_fees = 0.0
+    total_slippage = 0.0
+
+    for event in events:
+        bar_idx, sort_order, etype, key, leg = event
+
+        if etype == 'exit' and key in open_positions:
+            pos = open_positions[key]
+            # Calculate exit fill with slippage
+            raw_exit = leg.exit_price
+            if leg.direction == "LONG":
+                exit_fill = raw_exit * (1 - slip_pct)  # slippage works against you
+            else:
+                exit_fill = raw_exit * (1 + slip_pct)
+
+            # PnL for this leg
+            leg_shares = pos['shares'] * leg.weight
+            if leg.direction == "LONG":
+                leg_pnl = (exit_fill - pos['entry_fill']) * leg_shares
+            else:
+                leg_pnl = (pos['entry_fill'] - exit_fill) * leg_shares
+
+            # Fees
+            exit_fee = comm
+            leg_pnl -= exit_fee
+            total_fees += exit_fee
+
+            slip_cost = abs(raw_exit - exit_fill) * leg_shares
+            total_slippage += slip_cost
+
+            pnl_pct_port = (leg_pnl / pos['equity_at_entry']) * 100 if pos['equity_at_entry'] > 0 else 0
+
+            equity += leg_pnl
+            pos['remaining_weight'] -= leg.weight
+
+            fills.append(PortfolioFill(
+                trade=leg, shares=leg_shares,
+                entry_fill=pos['entry_fill'], exit_fill=exit_fill,
+                position_value=pos['shares'] * pos['entry_fill'],
+                pnl_dollar=leg_pnl, pnl_pct_portfolio=pnl_pct_port,
+                equity_at_entry=pos['equity_at_entry'], fees=exit_fee,
+            ))
+
+            # If all weight exited, close position
+            if pos['remaining_weight'] <= 0.01:
+                ticker_open_count[key[0]] -= 1
+                ticker_open_value[key[0]] -= pos['shares'] * pos['entry_fill']
+                del open_positions[key]
+
+            # Update equity curve and drawdown
+            equity_curve.append((bar_idx, equity))
+            if equity > peak_equity:
+                peak_equity = equity
+            dd_pct = (peak_equity - equity) / peak_equity * 100 if peak_equity > 0 else 0
+            dd_dollar = peak_equity - equity
+            if dd_pct > max_dd_pct:
+                max_dd_pct = dd_pct
+            if dd_dollar > max_dd_dollar:
+                max_dd_dollar = dd_dollar
+
+        elif etype == 'entry' and key not in open_positions:
+            ticker = key[0]
+
+            # Check capacity
+            if len(open_positions) >= max_pos:
+                skipped_capacity += 1
+                continue
+
+            # Check per-ticker concentration
+            if ticker_open_count[ticker] >= max_per_ticker:
+                skipped_concentration += 1
+                continue
+
+            # Check ticker allocation cap
+            if equity > 0 and ticker_open_value[ticker] / equity > max_ticker_alloc:
+                skipped_concentration += 1
+                continue
+
+            # Position sizing: risk_pct of equity / risk per share
+            if leg.risk_pct <= 0 or equity <= 0:
+                skipped_capital += 1
+                continue
+
+            risk_per_share = abs(leg.entry_price - leg.stop_price)
+            if risk_per_share <= 0:
+                skipped_capital += 1
+                continue
+
+            dollar_risk = equity * (risk_pct / 100.0)
+            shares = dollar_risk / risk_per_share
+            position_value = shares * leg.entry_price
+
+            # Cap position at max_ticker_alloc of equity
+            max_value = equity * max_ticker_alloc
+            if position_value > max_value:
+                shares = max_value / leg.entry_price
+                position_value = max_value
+
+            # Entry fill with slippage
+            if leg.direction == "LONG":
+                entry_fill = leg.entry_price * (1 + slip_pct)
+            else:
+                entry_fill = leg.entry_price * (1 - slip_pct)
+
+            # Entry fee
+            entry_fee = comm
+            total_fees += entry_fee
+            equity -= entry_fee  # deduct entry commission immediately
+
+            slip_cost = abs(leg.entry_price - entry_fill) * shares
+            total_slippage += slip_cost
+
+            open_positions[key] = {
+                'shares': shares,
+                'entry_fill': entry_fill,
+                'equity_at_entry': equity,
+                'remaining_weight': 1.0,
+            }
+            ticker_open_count[ticker] += 1
+            ticker_open_value[ticker] += position_value
+
+            equity_curve.append((bar_idx, equity))
+
+    # ── Results ──
+    final_equity = equity
+    total_return = (final_equity - start_capital) / start_capital * 100
+    n_fills = len(fills)
+    n_positions = len(position_groups)
+    n_taken = n_positions - skipped_capacity - skipped_concentration - skipped_capital
+
+    winners = [f for f in fills if f.pnl_dollar > 0]
+    losers = [f for f in fills if f.pnl_dollar <= 0]
+    win_rate = len(winners) / len(fills) * 100 if fills else 0
+
+    gross_profit = sum(f.pnl_dollar for f in winners) if winners else 0
+    gross_loss = abs(sum(f.pnl_dollar for f in losers)) if losers else 0
+    pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+
+    # CAGR — use actual trade dates, not bar indices
+    from datetime import datetime
+    all_dates = []
+    for f in fills:
+        try:
+            all_dates.append(datetime.strptime(f.trade.entry_date, "%Y-%m-%d"))
+            all_dates.append(datetime.strptime(f.trade.exit_date, "%Y-%m-%d"))
+        except (ValueError, AttributeError):
+            pass
+    if all_dates:
+        first_date = min(all_dates)
+        last_date = max(all_dates)
+        days_span = (last_date - first_date).days
+        years = days_span / 365.25 if days_span > 0 else 1.0
+        cagr = ((final_equity / start_capital) ** (1.0 / years) - 1) * 100 if years > 0 else 0
+    else:
+        years = 1.0
+        cagr = 0.0
+
+    # Per-ticker PnL
+    ticker_pnl = defaultdict(float)
+    for f in fills:
+        ticker_pnl[f.trade.ticker] += f.pnl_dollar
+    sorted_ticker_pnl = sorted(ticker_pnl.items(), key=lambda x: x[1], reverse=True)
+
+    print("\n" + "=" * 100)
+    print(f"  PORTFOLIO SIMULATION — {label}")
+    print("=" * 100)
+    print(f"\n  ── Capital & Sizing ──")
+    print(f"  Starting Capital:        ${start_capital:,.0f}")
+    print(f"  Risk Per Trade:          {risk_pct}% of equity")
+    print(f"  Max Concurrent:          {max_pos} positions")
+    print(f"  Max Per Ticker:          {max_per_ticker} concurrent / {cfg.portfolio_max_ticker_alloc}% of equity")
+    print(f"  Slippage:                {cfg.portfolio_slippage_pct}% per fill")
+    print(f"  Commission:              ${comm:.2f} per fill")
+
+    print(f"\n  ── Execution ──")
+    print(f"  Total Setups Available:  {n_positions}")
+    print(f"  Positions Taken:         {n_taken}")
+    print(f"  Skipped (capacity):      {skipped_capacity}")
+    print(f"  Skipped (concentration): {skipped_concentration}")
+    print(f"  Skipped (capital/risk):  {skipped_capital}")
+    print(f"  Total Fills (legs):      {n_fills}")
+
+    print(f"\n  ── Performance ──")
+    print(f"  Final Equity:            ${final_equity:,.2f}")
+    print(f"  Total Return:            {total_return:+.2f}%")
+    print(f"  CAGR:                    {cagr:+.2f}% ({years:.1f} years)")
+    print(f"  Profit Factor:           {pf:.2f}")
+    print(f"  Win Rate (fills):        {win_rate:.1f}%")
+    print(f"  Avg Win:                 ${sum(f.pnl_dollar for f in winners) / len(winners):,.2f}" if winners else "  Avg Win:                 $0")
+    print(f"  Avg Loss:                ${sum(f.pnl_dollar for f in losers) / len(losers):,.2f}" if losers else "  Avg Loss:                $0")
+
+    print(f"\n  ── Drawdown ──")
+    print(f"  Max Drawdown:            {max_dd_pct:.2f}% (${max_dd_dollar:,.0f})")
+    print(f"  Peak Equity:             ${peak_equity:,.2f}")
+
+    print(f"\n  ── Friction Costs ──")
+    print(f"  Total Slippage:          ${total_slippage:,.2f}")
+    print(f"  Total Commissions:       ${total_fees:,.2f}")
+    print(f"  Total Friction:          ${total_slippage + total_fees:,.2f} ({(total_slippage + total_fees) / start_capital * 100:.2f}% of starting capital)")
+
+    print(f"\n  ── Concentration ──")
+    if sorted_ticker_pnl:
+        total_dollar_pnl = final_equity - start_capital
+        for i, (tkr, pnl) in enumerate(sorted_ticker_pnl[:5]):
+            pct_of_total = pnl / total_dollar_pnl * 100 if total_dollar_pnl != 0 else 0
+            print(f"  #{i+1} {tkr:<8}  ${pnl:>+12,.2f}  ({pct_of_total:>+6.1f}% of total PnL)")
+        print(f"  ---")
+        top1_pnl = sorted_ticker_pnl[0][1] if sorted_ticker_pnl else 0
+        top2_pnl = sum(p for _, p in sorted_ticker_pnl[:2])
+        ex_top1 = total_dollar_pnl - top1_pnl
+        ex_top2 = total_dollar_pnl - top2_pnl
+        print(f"  Ex-Top-1 PnL:            ${ex_top1:>+,.2f}")
+        print(f"  Ex-Top-2 PnL:            ${ex_top2:>+,.2f}")
+        n_profit_tickers = sum(1 for _, p in sorted_ticker_pnl if p > 0)
+        print(f"  Profitable Tickers:      {n_profit_tickers}/{len(sorted_ticker_pnl)}")
+
+    # Bottom 5
+    if len(sorted_ticker_pnl) > 5:
+        print(f"\n  ── Worst Tickers ──")
+        for tkr, pnl in sorted_ticker_pnl[-5:]:
+            print(f"  {tkr:<8}  ${pnl:>+12,.2f}")
+
+    print("\n" + "=" * 100)
+
+    return {
+        'final_equity': final_equity,
+        'total_return': total_return,
+        'cagr': cagr,
+        'pf': pf,
+        'max_dd_pct': max_dd_pct,
+        'max_dd_dollar': max_dd_dollar,
+        'win_rate': win_rate,
+        'n_taken': n_taken,
+        'n_fills': n_fills,
+        'total_friction': total_slippage + total_fees,
+        'skipped_capacity': skipped_capacity,
+        'skipped_concentration': skipped_concentration,
+    }
+
+
+def run_concentration_stress_test(all_trades, cfg, label="Stress Test"):
+    """
+    Run portfolio sim under multiple concentration regimes and compare.
+    """
+    from copy import copy
+    scenarios = [
+        # (label, max_per_ticker, max_ticker_alloc_pct)
+        ("Loose (2/ticker, 30%)",   2, 30.0),
+        ("Current (2/ticker, 25%)", 2, 25.0),
+        ("Moderate (1/ticker, 20%)", 1, 20.0),
+        ("Tight (1/ticker, 15%)",   1, 15.0),
+        ("Very Tight (1/ticker, 10%)", 1, 10.0),
+    ]
+
+    # Also test max concurrent positions
+    concurrency_scenarios = [
+        # (label, max_positions)
+        ("8 concurrent", 8),
+        ("6 concurrent (current)", 6),
+        ("4 concurrent", 4),
+        ("3 concurrent", 3),
+    ]
+
+    results = []
+    print("\n" + "=" * 100)
+    print(f"  CONCENTRATION STRESS TEST — {label}")
+    print("=" * 100)
+
+    # Suppress per-scenario verbose output by redirecting
+    import io, sys
+
+    print(f"\n  ── Per-Ticker Concentration Limits (max {cfg.portfolio_max_positions} concurrent) ──")
+    print(f"  {'Scenario':<28} {'Return':>8} {'CAGR':>7} {'PF':>6} {'MaxDD':>7} {'Taken':>6} {'Skip':>6} {'Top1%':>7}")
+    print(f"  {'─'*28} {'─'*8} {'─'*7} {'─'*6} {'─'*7} {'─'*6} {'─'*6} {'─'*7}")
+
+    for scenario_label, max_per, max_alloc in scenarios:
+        test_cfg = copy(cfg)
+        test_cfg.portfolio_max_per_ticker = max_per
+        test_cfg.portfolio_max_ticker_alloc = max_alloc
+
+        # Capture and suppress output
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        res = run_portfolio_simulation(all_trades, test_cfg, label=scenario_label)
+        sys.stdout = old_stdout
+
+        if res:
+            # Compute top1 concentration from fills
+            from collections import defaultdict
+            ticker_pnl = defaultdict(float)
+            closed = [t for t in all_trades if t.exit_bar >= 0 and t.exit_reason not in ("OPEN_AT_END", "")]
+            # Re-derive from result
+            total_pnl = res['final_equity'] - cfg.portfolio_start_capital
+            top1_pct = "N/A"
+
+            print(f"  {scenario_label:<28} {res['total_return']:>+7.1f}% {res['cagr']:>+6.1f}% {res['pf']:>5.2f} {res['max_dd_pct']:>6.1f}% {res['n_taken']:>5} {res['skipped_concentration']:>5}   —")
+            results.append((scenario_label, res))
+
+    # Concurrency stress
+    print(f"\n  ── Max Concurrent Positions ({cfg.portfolio_max_per_ticker}/ticker, {cfg.portfolio_max_ticker_alloc}% alloc) ──")
+    print(f"  {'Scenario':<28} {'Return':>8} {'CAGR':>7} {'PF':>6} {'MaxDD':>7} {'Taken':>6} {'SkipCap':>8}")
+    print(f"  {'─'*28} {'─'*8} {'─'*7} {'─'*6} {'─'*7} {'─'*6} {'─'*8}")
+
+    for scenario_label, max_pos in concurrency_scenarios:
+        test_cfg = copy(cfg)
+        test_cfg.portfolio_max_positions = max_pos
+
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        res = run_portfolio_simulation(all_trades, test_cfg, label=scenario_label)
+        sys.stdout = old_stdout
+
+        if res:
+            print(f"  {scenario_label:<28} {res['total_return']:>+7.1f}% {res['cagr']:>+6.1f}% {res['pf']:>5.2f} {res['max_dd_pct']:>6.1f}% {res['n_taken']:>5} {res['skipped_capacity']:>7}")
+
+    # Slippage sensitivity
+    print(f"\n  ── Slippage Sensitivity ({cfg.portfolio_max_positions} concurrent, {cfg.portfolio_max_per_ticker}/ticker) ──")
+    print(f"  {'Scenario':<28} {'Return':>8} {'CAGR':>7} {'PF':>6} {'MaxDD':>7} {'Friction':>10}")
+    print(f"  {'─'*28} {'─'*8} {'─'*7} {'─'*6} {'─'*7} {'─'*10}")
+
+    for slip_label, slip_pct in [("Zero slip", 0.0), ("0.05% slip", 0.05), ("0.10% slip (current)", 0.10), ("0.20% slip", 0.20), ("0.50% slip (worst case)", 0.50)]:
+        test_cfg = copy(cfg)
+        test_cfg.portfolio_slippage_pct = slip_pct
+
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        res = run_portfolio_simulation(all_trades, test_cfg, label=slip_label)
+        sys.stdout = old_stdout
+
+        if res:
+            print(f"  {slip_label:<28} {res['total_return']:>+7.1f}% {res['cagr']:>+6.1f}% {res['pf']:>5.2f} {res['max_dd_pct']:>6.1f}% ${res['total_friction']:>9,.0f}")
+
+    print("\n" + "=" * 100)
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(description="Run V5 Hybrid Wyckoff/CAN SLIM backtest")
     parser.add_argument("--data-dir", help="Directory containing OHLC CSV files")
+    parser.add_argument("--extra-data", nargs="*", help="V8: Additional data directories to scan")
     parser.add_argument("--walk-forward", action="store_true", help="Run walk-forward validation")
     parser.add_argument("--forward-test", action="store_true",
                         help="Split data 70/30 for in-sample/out-of-sample comparison")
     parser.add_argument("--long-only", action="store_true", help="Run LONG side only")
+    parser.add_argument("--stress-test", action="store_true",
+                        help="Run concentration/slippage stress test on portfolio sim")
     parser.add_argument("--compare", action="store_true", help="Run both V4 and V5 for comparison")
 
     args = parser.parse_args()
@@ -1722,7 +2307,20 @@ def main():
         print("ERROR: Data directory not found.")
         sys.exit(1)
 
+    # V8: Collect extra data directories
+    extra_dirs = args.extra_data or []
+
     csv_files = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
+    # V8: Merge CSVs from extra data directories (dedup by ticker)
+    seen_tickers = set(extract_ticker(f) for f in csv_files)
+    for edir in extra_dirs:
+        if os.path.isdir(edir):
+            for f in sorted(glob.glob(os.path.join(edir, "*.csv"))):
+                tkr = extract_ticker(f)
+                if tkr not in seen_tickers:
+                    csv_files.append(f)
+                    seen_tickers.add(tkr)
+    csv_files = sorted(csv_files, key=lambda f: extract_ticker(f))
     if not csv_files:
         print(f"ERROR: No CSV files found in {data_dir}")
         sys.exit(1)
@@ -1759,9 +2357,15 @@ def main():
 
         print(f"\n  ═══ IN-SAMPLE (before {cutoff_date}) ═══")
         print_grand_summary(is_trades, label=f"V6 HYBRID — IS (before {cutoff_date})")
+        run_portfolio_simulation(is_trades, cfg, label=f"IS (before {cutoff_date})")
 
         print(f"\n  ═══ OUT-OF-SAMPLE ({cutoff_date}+) ═══")
         print_grand_summary(oos_trades, label=f"V6 HYBRID — OOS ({cutoff_date}+)")
+        run_portfolio_simulation(oos_trades, cfg, label=f"OOS ({cutoff_date}+)")
+
+        if args.stress_test:
+            run_concentration_stress_test(is_trades, cfg, label=f"IS STRESS (before {cutoff_date})")
+            run_concentration_stress_test(oos_trades, cfg, label=f"OOS STRESS ({cutoff_date}+)")
         return
 
     if args.walk_forward:
@@ -1780,15 +2384,18 @@ def main():
     print(f"    Short Split Exit:      {cfg.short_split_exit} (V6: runner killed)")
     print(f"    Short Time Stop:       {cfg.short_time_stop} bars (V6: was 50)")
     print(f"    Circuit Breaker:       {cfg.short_circuit_breaker} (trailing {cfg.short_circuit_lookback} trades, min WR {cfg.short_circuit_min_wr}%)")
+    print(f"    Min Reward:            {cfg.short_min_reward_pct}% (V8: 10MA must be >= N% below entry)")
     print(f"    ── LONG ──")
     print(f"    Long Enabled:          {cfg.enable_long}")
-    print(f"    Long Fast Path:        {cfg.long_fast_path} (>= {cfg.fast_path_min_crash}% crash → FGD)")
+    print(f"    Long Fast Path:        {cfg.long_fast_path} (>= {cfg.fast_path_min_crash}% crash → close > prior HIGH)")
     print(f"    Long Base Path:        min {cfg.min_base_bars} bars, abs >= {cfg.absorption_threshold}")
-    print(f"    Stop Cap:              {cfg.long_stop_cap_atr_mult}x ATR")
+    print(f"    Stop Cap:              {cfg.long_stop_cap_atr_mult}x ATR / max {cfg.long_max_stop_pct}%")
+    print(f"    Ticker Cooldown:       {cfg.long_ticker_cooldown} (skip after {cfg.long_ticker_max_consec_stops} consec stops)")
     print(f"    Long Exit Mode:        {cfg.long_exit_mode}")
     print(f"    R1/R2 Targets:         {cfg.long_r1_target}R / {cfg.long_r2_target}R")
     print(f"    Long Time Stop:        {cfg.long_time_stop} bars")
     print(f"    Trail Channel:         {cfg.long_trail_channel} bars")
+    print(f"    Max Loss Cap:          {cfg.max_loss_pct}% (V8: force exit if unrealized loss exceeds)")
     print(f"    Forward Test Date:     {cfg.forward_test_date}")
 
     print(f"\n  ── Per-Ticker Results ──")
@@ -1805,6 +2412,10 @@ def main():
         print_ticker_summary(ticker, t_trades)
 
     print_grand_summary(all_trades, label="V5 HYBRID")
+    run_portfolio_simulation(all_trades, cfg, label="FULL BACKTEST")
+
+    if args.stress_test:
+        run_concentration_stress_test(all_trades, cfg, label="FULL BACKTEST STRESS")
 
 
 if __name__ == "__main__":
