@@ -1719,6 +1719,7 @@ def main():
     if args.data_dir:
         candidates.append(args.data_dir)
     candidates.extend([
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs2"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs2"),
         "/home/user/logs2",
