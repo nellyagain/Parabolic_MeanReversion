@@ -94,6 +94,14 @@ class Config:
     adr_len: int = 20
     max_stop_vs_adr: float = 1.5     # Tightened from 2.5x for loss containment (plan default: 1.0)
 
+    # Risk-Cap Gate (V6): reject trade if stop distance > max_risk_pct of entry
+    max_risk_pct: float = 0.0        # 0 = disabled; e.g. 15.0 = reject if risk > 15%
+
+    # Tradability Gates (V6): prevent trades on un-shortable/illiquid names
+    min_trade_price: float = 0.0     # 0 = disabled; e.g. 5.0 = reject if price < $5
+    min_dollar_vol: float = 0.0      # 0 = disabled; e.g. 1e6 = reject if avg daily $ vol < $1M
+    dollar_vol_lookback: int = 20    # Bars for avg daily dollar volume calc
+
     # Risk Management
     short_stop_mode: str = "Run Peak"    # V4: Run Peak best for shorts (ATR too tight for parabolic vol)
     long_stop_mode: str = "ATR Based"    # V4: ATR-based (Washout Low too wide)
@@ -776,36 +784,51 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 short_adr_ok = short_stop_width <= (adr_pct * cfg.max_stop_vs_adr)
 
             if short_entry_proxy and short_close_ok and short_adr_ok:
-                short_setup_triggered = True
+                # Tradability gates (V6): reject un-tradable names
+                tradability_ok = True
+                if cfg.min_trade_price > 0 and bar.close < cfg.min_trade_price:
+                    tradability_ok = False
+                if cfg.min_dollar_vol > 0 and len(dollar_vols) >= cfg.dollar_vol_lookback:
+                    avg_dv = sma(dollar_vols, cfg.dollar_vol_lookback)
+                    if avg_dv < cfg.min_dollar_vol:
+                        tradability_ok = False
 
-                # Targets
-                tf = sma(closes, cfg.target_ma_fast)
-                ts = sma(closes, cfg.target_ma_slow)
+                # Risk-cap gate (V6): reject if stop distance exceeds max_risk_pct
                 risk_pct = ((short_stop - bar.close) / bar.close) * 100 if bar.close > 0 else 0.0
+                risk_ok = not (cfg.max_risk_pct > 0 and risk_pct > cfg.max_risk_pct)
 
-                trade = Trade(
-                    ticker=ticker,
-                    direction="SHORT",
-                    entry_bar=i,
-                    entry_date=bar.date,
-                    entry_price=bar.close,
-                    stop_price=short_stop,
-                    target_fast=tf,
-                    target_slow=ts,
-                    extension_pct=extension_pct,
-                    rolling_gain_pct=rolling_gain_pct,
-                    green_streak=green_streak,
-                    risk_pct=risk_pct,
-                )
-                trades.append(trade)
-                open_trades.append(trade)
+                if not tradability_ok or not risk_ok:
+                    pass  # Rejected by V6 gates
+                else:
+                    short_setup_triggered = True
 
-                # Reset
-                short_setup_active = False
-                last_short_bar = i
-                short_avwap_num = 0.0
-                short_avwap_den = 0.0
-                short_run_avwap = 0.0
+                    # Targets
+                    tf = sma(closes, cfg.target_ma_fast)
+                    ts = sma(closes, cfg.target_ma_slow)
+
+                    trade = Trade(
+                        ticker=ticker,
+                        direction="SHORT",
+                        entry_bar=i,
+                        entry_date=bar.date,
+                        entry_price=bar.close,
+                        stop_price=short_stop,
+                        target_fast=tf,
+                        target_slow=ts,
+                        extension_pct=extension_pct,
+                        rolling_gain_pct=rolling_gain_pct,
+                        green_streak=green_streak,
+                        risk_pct=risk_pct,
+                    )
+                    trades.append(trade)
+                    open_trades.append(trade)
+
+                    # Reset
+                    short_setup_active = False
+                    last_short_bar = i
+                    short_avwap_num = 0.0
+                    short_avwap_den = 0.0
+                    short_run_avwap = 0.0
 
         # TIMEOUT
         if short_setup_active and (i - short_setup_bar > cfg.short_setup_timeout):
@@ -895,33 +918,48 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     confirm_ok = green_streak >= cfg.long_confirm_green_days
 
             if long_entry_proxy and long_close_ok and long_adr_ok and confirm_ok:
-                long_setup_triggered = True
+                # Tradability gates (V6): reject un-tradable names
+                tradability_ok = True
+                if cfg.min_trade_price > 0 and bar.close < cfg.min_trade_price:
+                    tradability_ok = False
+                if cfg.min_dollar_vol > 0 and len(dollar_vols) >= cfg.dollar_vol_lookback:
+                    avg_dv = sma(dollar_vols, cfg.dollar_vol_lookback)
+                    if avg_dv < cfg.min_dollar_vol:
+                        tradability_ok = False
 
-                tf = sma(closes, cfg.target_ma_fast)
-                ts = sma(closes, cfg.target_ma_slow)
+                # Risk-cap gate (V6): reject if stop distance exceeds max_risk_pct
                 risk_pct = ((bar.close - long_stop) / bar.close) * 100 if bar.close > 0 else 0.0
+                risk_ok = not (cfg.max_risk_pct > 0 and risk_pct > cfg.max_risk_pct)
 
-                trade = Trade(
-                    ticker=ticker,
-                    direction="LONG",
-                    entry_bar=i,
-                    entry_date=bar.date,
-                    entry_price=bar.close,
-                    stop_price=long_stop,
-                    target_fast=tf,
-                    target_slow=ts,
-                    crash_from_peak=crash_from_peak,
-                    risk_pct=risk_pct,
-                )
-                trades.append(trade)
-                open_trades.append(trade)
+                if not tradability_ok or not risk_ok:
+                    pass  # Rejected by V6 gates
+                else:
+                    long_setup_triggered = True
 
-                # Reset
-                long_setup_active = False
-                last_long_bar = i
-                long_avwap_num = 0.0
-                long_avwap_den = 0.0
-                long_run_avwap = 0.0
+                    tf = sma(closes, cfg.target_ma_fast)
+                    ts = sma(closes, cfg.target_ma_slow)
+
+                    trade = Trade(
+                        ticker=ticker,
+                        direction="LONG",
+                        entry_bar=i,
+                        entry_date=bar.date,
+                        entry_price=bar.close,
+                        stop_price=long_stop,
+                        target_fast=tf,
+                        target_slow=ts,
+                        crash_from_peak=crash_from_peak,
+                        risk_pct=risk_pct,
+                    )
+                    trades.append(trade)
+                    open_trades.append(trade)
+
+                    # Reset
+                    long_setup_active = False
+                    last_long_bar = i
+                    long_avwap_num = 0.0
+                    long_avwap_den = 0.0
+                    long_run_avwap = 0.0
 
         # TIMEOUT
         if long_setup_active and (i - long_setup_bar > cfg.long_setup_timeout):
