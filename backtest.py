@@ -109,6 +109,19 @@ class Config:
     # Backtest-specific
     max_trade_bars: int = 50  # Max bars to hold a trade before timeout
 
+    # ── Structural LONG Filters (V5) ──
+    # Pre-crash uptrend: require stock was healthy before crash
+    long_require_uptrend: bool = False
+    long_uptrend_ma_len: int = 200    # SMA length for pre-crash trend check
+    long_uptrend_mode: str = "above"  # "above" = price > SMA, "rising" = SMA rising, "both" = both
+    long_uptrend_slope_bars: int = 20 # Bars to measure SMA slope over
+
+    # Entry confirmation: don't catch the knife, wait for bounce proof
+    long_require_confirmation: bool = False
+    long_confirm_mode: str = "reclaim_ma"  # "reclaim_ma", "higher_low_break", "green_streak"
+    long_confirm_ma_len: int = 10          # MA to reclaim for "reclaim_ma" mode
+    long_confirm_green_days: int = 2       # Consecutive green days for "green_streak" mode
+
 
 # ═══════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -664,7 +677,37 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                 else:
                     had_prior_run = False
 
-        washout_detected = liquidity_ok and is_crash_candidate and had_prior_run
+        # V5: Pre-crash uptrend filter — was the stock healthy before it crashed?
+        uptrend_ok = True
+        if cfg.long_require_uptrend and is_crash_candidate and peak_bar_idx >= 0:
+            # Check conditions at the peak bar (before the crash started)
+            # Need enough bars before peak to compute 200 SMA
+            if peak_bar_idx >= cfg.long_uptrend_ma_len:
+                pre_crash_closes = closes[:peak_bar_idx + 1]
+                ma_at_peak = sma(pre_crash_closes, cfg.long_uptrend_ma_len)
+                price_above_ma = closes[peak_bar_idx] > ma_at_peak
+
+                ma_rising = True
+                if cfg.long_uptrend_mode in ("rising", "both"):
+                    # Check if MA was rising: compare MA now vs N bars ago
+                    slope_bars = cfg.long_uptrend_slope_bars
+                    if peak_bar_idx >= cfg.long_uptrend_ma_len + slope_bars:
+                        earlier_closes = closes[:peak_bar_idx - slope_bars + 1]
+                        ma_earlier = sma(earlier_closes, cfg.long_uptrend_ma_len)
+                        ma_rising = ma_at_peak > ma_earlier
+                    else:
+                        ma_rising = False  # Not enough data to confirm rising
+
+                if cfg.long_uptrend_mode == "above":
+                    uptrend_ok = price_above_ma
+                elif cfg.long_uptrend_mode == "rising":
+                    uptrend_ok = ma_rising
+                elif cfg.long_uptrend_mode == "both":
+                    uptrend_ok = price_above_ma and ma_rising
+            else:
+                uptrend_ok = False  # Not enough history for 200 SMA
+
+        washout_detected = liquidity_ok and is_crash_candidate and had_prior_run and uptrend_ok
 
         # ═══════════════════════════════════════════════════════════
         # SHORT SETUP STATE MACHINE
@@ -832,7 +875,26 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
             if cfg.use_adr_filter and adr_pct > 0 and cfg.long_stop_mode != "ATR Based":
                 long_adr_ok = long_stop_width <= (adr_pct * cfg.max_stop_vs_adr)
 
-            if long_entry_proxy and long_close_ok and long_adr_ok:
+            # V5: Entry confirmation — require bounce proof before entering
+            confirm_ok = True
+            if cfg.long_require_confirmation:
+                if cfg.long_confirm_mode == "reclaim_ma":
+                    # Price must close above short MA (e.g., 10 SMA)
+                    confirm_ma = sma(closes, cfg.long_confirm_ma_len)
+                    confirm_ok = bar.close > confirm_ma
+                elif cfg.long_confirm_mode == "higher_low_break":
+                    # Need higher low + break of prior day high
+                    if i >= 2:
+                        higher_low = bar.low > bars[i - 1].low
+                        break_prior_high = bar.close > bars[i - 1].high
+                        confirm_ok = higher_low and break_prior_high
+                    else:
+                        confirm_ok = False
+                elif cfg.long_confirm_mode == "green_streak":
+                    # Need N consecutive green days
+                    confirm_ok = green_streak >= cfg.long_confirm_green_days
+
+            if long_entry_proxy and long_close_ok and long_adr_ok and confirm_ok:
                 long_setup_triggered = True
 
                 tf = sma(closes, cfg.target_ma_fast)
