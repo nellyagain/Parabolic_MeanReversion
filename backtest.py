@@ -117,6 +117,41 @@ class Config:
     # Backtest-specific
     max_trade_bars: int = 50  # Max bars to hold a trade before timeout
 
+    # ── V9: Liquid-Aware Short Detection ──
+    # Replaces percent-based "parabolic" with volatility-normalized triggers
+    short_detection_mode: str = "zscore"  # "percent" (legacy) or "zscore" (V9)
+
+    # Z-score extension: z = (close - SMA) / ATR
+    short_z_threshold: float = 3.0       # Min z-score (ATRs above MA) to flag extension
+    short_z_ma_len: int = 20             # MA length for z-score
+    short_z_atr_len: int = 20            # ATR length for z-score denominator
+
+    # RVOL spike gate: require elevated volume near setup
+    short_require_rvol: bool = True
+    short_rvol_min: float = 2.0          # Min RVOL for any bar in lookback window
+    short_rvol_lookback: int = 3         # Bars to look back for RVOL spike
+    short_rvol_baseline: int = 20        # Baseline period for avg volume
+
+    # Event structure: gap-up or blowoff bar
+    short_require_event: bool = True
+    short_gap_atr_mult: float = 0.5      # Gap-up >= N * ATR counts as event
+    short_blowoff_range_mult: float = 2.0  # Intraday range >= N * ATR counts as blowoff
+
+    # Reversal confirmation (V9 trigger): require proof of reversal before entry
+    short_require_reversal: bool = True
+    short_reversal_mode: str = "any"     # "bearish_bar", "close_below_vwap", "failed_breakout", "any"
+
+    # V9 stop: ATR-based tighter stop for liquid names
+    short_v9_stop_atr_mult: float = 2.0  # ATR multiplier for V9 stop (tighter than Run Peak)
+
+    # ── Slippage & Gap Stress Model ──
+    slippage_pct: float = 0.10           # Entry + exit slippage in % (one-way)
+    gap_stress_pct: float = 0.0          # Additional adverse gap stress in %
+
+    # ── Dev / OOS Split ──
+    dev_oos_split: float = 0.6           # 60% dev, 40% OOS (by ticker hash)
+    dev_oos_seed: int = 42               # Seed for deterministic split
+
     # ── Structural LONG Filters (V5) ──
     # Pre-crash uptrend: require stock was healthy before crash
     long_require_uptrend: bool = False
@@ -213,6 +248,40 @@ def bb_upper(closes: list, length: int, mult: float) -> float:
     variance = sum((x - mean) ** 2 for x in window) / length
     std = math.sqrt(variance)
     return mean + mult * std
+
+
+def apply_slippage(price: float, direction: str, side: str, slip_pct: float, gap_pct: float) -> float:
+    """Apply slippage + gap stress to a fill price.
+    direction: 'SHORT' or 'LONG'
+    side: 'entry' or 'exit'
+    For SHORT entry: we sell, adverse = lower fill → price * (1 - slip - gap)
+    For SHORT exit: we buy to cover, adverse = higher fill → price * (1 + slip + gap)
+    For LONG entry: we buy, adverse = higher fill → price * (1 + slip + gap)
+    For LONG exit: we sell, adverse = lower fill → price * (1 - slip - gap)
+    """
+    total_slip = (slip_pct + gap_pct) / 100.0
+    if (direction == "SHORT" and side == "entry") or (direction == "LONG" and side == "exit"):
+        return price * (1 - total_slip)
+    else:
+        return price * (1 + total_slip)
+
+
+def zscore_ext(closes: list, bars_list: list, ma_len: int, atr_len: int) -> float:
+    """Z-score extension: (close - SMA) / ATR. Measures distance from MA in ATR units."""
+    if len(closes) < ma_len or len(bars_list) < atr_len + 1:
+        return 0.0
+    ma = sma(closes, ma_len)
+    atr = atr_calc(bars_list, atr_len)
+    if atr <= 0 or ma <= 0:
+        return 0.0
+    return (closes[-1] - ma) / atr
+
+
+def ticker_dev_oos(ticker: str, split: float, seed: int) -> str:
+    """Deterministic dev/OOS assignment based on ticker hash. Returns 'dev' or 'oos'."""
+    import hashlib
+    h = int(hashlib.md5(f"{seed}_{ticker}".encode()).hexdigest(), 16)
+    return "dev" if (h % 1000) / 1000.0 < split else "oos"
 
 
 def load_csv(filepath: str) -> list:
@@ -581,39 +650,75 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
         # ═══════════════════════════════════════════════════════════
         # PARABOLIC ADVANCE DETECTION
         # ═══════════════════════════════════════════════════════════
-        # Rolling gain
+        # Rolling gain (used by both modes for context tracking)
         window_lows = lows[max(0, i - cfg.gain_lookback + 1):i + 1]
         recent_low = min(window_lows) if window_lows else bar.low
         rolling_gain_pct = ((bar.close - recent_low) / recent_low) * 100 if recent_low > 0 else 0.0
 
-        gain_threshold = cfg.manual_gain_pct if cfg.use_manual_threshold else \
-            (cfg.largecap_gain_pct if bar.close >= cfg.cap_cutoff_price else cfg.smallcap_gain_pct)
-        is_parabolic_gain = enough_bars_gain and rolling_gain_pct >= gain_threshold
-
-        # Consecutive green days (tracked above before early-bar guard)
-        has_green_streak = green_streak >= cfg.min_green_days
-
-        # Extension above MA
+        # Extension above MA (used by both modes)
         ext_ma = sma(closes, cfg.ext_ma_len)
         extension_pct = ((bar.close - ext_ma) / ext_ma) * 100 if ext_ma > 0 else 0.0
-        is_extended = extension_pct >= cfg.min_ext_above_ma
 
-        # Bollinger Band gate (optional)
-        bb_ok = True
-        if cfg.use_ext_bb_filter:
-            bb_up = bb_upper(closes, cfg.ext_ma_len, cfg.bb_dev_mult)
-            bb_ok = bar.close > bb_up
+        if cfg.short_detection_mode == "zscore":
+            # ── V9: Volatility-Normalized Detection ──
+            # Z-score: distance from MA in ATR units
+            z_ext = zscore_ext(closes, bars[:i + 1], cfg.short_z_ma_len, cfg.short_z_atr_len)
+            is_extended_v9 = z_ext >= cfg.short_z_threshold
 
-        # Trend filter (optional — OFF by default)
-        trend_ok = True
-        if cfg.use_trend_filter:
-            trend_ma = sma(closes, cfg.trend_ma_len)
-            trend_ok = bar.close > trend_ma
+            # RVOL spike: any bar in lookback window had elevated volume
+            rvol_spike_ok = True
+            if cfg.short_require_rvol:
+                rvol_spike_ok = False
+                vol_base = sma(volumes, cfg.short_rvol_baseline) if len(volumes) >= cfg.short_rvol_baseline else 0
+                if vol_base > 0:
+                    for lb in range(max(0, len(volumes) - cfg.short_rvol_lookback), len(volumes)):
+                        if volumes[lb] / vol_base >= cfg.short_rvol_min:
+                            rvol_spike_ok = True
+                            break
 
-        # Combined advance detection
-        parabolic_advance_detected = (liquidity_ok and is_parabolic_gain and
-                                      has_green_streak and is_extended and
-                                      bb_ok and trend_ok)
+            # Event structure: gap-up or blowoff bar in recent bars
+            event_ok = True
+            if cfg.short_require_event:
+                event_ok = False
+                cur_atr = atr_calc(bars[:i + 1], cfg.atr_len)
+                if cur_atr > 0:
+                    # Check current bar and recent bars for event structure
+                    for lb in range(max(1, i - cfg.short_rvol_lookback + 1), i + 1):
+                        # Gap-up: open > prior close by threshold
+                        gap = bars[lb].open - bars[lb - 1].close
+                        if gap >= cfg.short_gap_atr_mult * cur_atr:
+                            event_ok = True
+                            break
+                        # Blowoff: intraday range expansion
+                        bar_range = bars[lb].high - bars[lb].low
+                        if bar_range >= cfg.short_blowoff_range_mult * cur_atr:
+                            event_ok = True
+                            break
+
+            parabolic_advance_detected = liquidity_ok and is_extended_v9 and rvol_spike_ok and event_ok
+
+        else:
+            # ── Legacy: Percent-Based Detection ──
+            gain_threshold = cfg.manual_gain_pct if cfg.use_manual_threshold else \
+                (cfg.largecap_gain_pct if bar.close >= cfg.cap_cutoff_price else cfg.smallcap_gain_pct)
+            is_parabolic_gain = enough_bars_gain and rolling_gain_pct >= gain_threshold
+
+            has_green_streak = green_streak >= cfg.min_green_days
+            is_extended = extension_pct >= cfg.min_ext_above_ma
+
+            bb_ok = True
+            if cfg.use_ext_bb_filter:
+                bb_up = bb_upper(closes, cfg.ext_ma_len, cfg.bb_dev_mult)
+                bb_ok = bar.close > bb_up
+
+            trend_ok = True
+            if cfg.use_trend_filter:
+                trend_ma = sma(closes, cfg.trend_ma_len)
+                trend_ok = bar.close > trend_ma
+
+            parabolic_advance_detected = (liquidity_ok and is_parabolic_gain and
+                                          has_green_streak and is_extended and
+                                          bb_ok and trend_ok)
 
         # ═══════════════════════════════════════════════════════════
         # CLIMAX VOLUME DETECTION
@@ -752,25 +857,51 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
         # TRIGGER
         if short_setup_active and (i - short_setup_bar) >= cfg.min_bars_after_setup:
             short_entry_proxy = False
-            if cfg.short_trigger == "First Red Day":
-                short_entry_proxy = bar.close < bar.open and i > 0 and bar.close < bars[i - 1].close
-            elif cfg.short_trigger == "Close < Prior Low":
-                short_entry_proxy = i > 0 and bar.close < bars[i - 1].low
-            elif cfg.short_trigger == "Close < Run AVWAP":
-                short_entry_proxy = short_run_avwap > 0 and bar.close < short_run_avwap
-            elif cfg.short_trigger == "Any Reversal":
-                short_entry_proxy = (
-                    (i > 0 and bar.close < bars[i - 1].low) or
-                    (bar.close < bar.open and i > 0 and bar.close < bars[i - 1].close) or
-                    (short_run_avwap > 0 and bar.close < short_run_avwap)
-                )
+
+            if cfg.short_detection_mode == "zscore" and cfg.short_require_reversal:
+                # V9 reversal confirmation triggers
+                bar_rng_v9 = max(bar.high - bar.low, 0.0001)
+                # Bearish bar: close in bottom 30% of range and red
+                is_bearish_bar = (bar.close < bar.open and
+                                  (bar.high - bar.close) / bar_rng_v9 >= 0.7)
+                # Close below VWAP proxy (OHLC4 as daily VWAP approximation)
+                is_below_vwap = bar.close < bar.ohlc4
+                # Failed breakout: made new high but closed below prior bar's close
+                is_failed_bo = (i > 0 and bar.high > bars[i - 1].high and
+                                bar.close < bars[i - 1].close)
+
+                if cfg.short_reversal_mode == "bearish_bar":
+                    short_entry_proxy = is_bearish_bar
+                elif cfg.short_reversal_mode == "close_below_vwap":
+                    short_entry_proxy = is_below_vwap
+                elif cfg.short_reversal_mode == "failed_breakout":
+                    short_entry_proxy = is_failed_bo
+                elif cfg.short_reversal_mode == "any":
+                    short_entry_proxy = is_bearish_bar or is_below_vwap or is_failed_bo
+            else:
+                # Legacy trigger modes
+                if cfg.short_trigger == "First Red Day":
+                    short_entry_proxy = bar.close < bar.open and i > 0 and bar.close < bars[i - 1].close
+                elif cfg.short_trigger == "Close < Prior Low":
+                    short_entry_proxy = i > 0 and bar.close < bars[i - 1].low
+                elif cfg.short_trigger == "Close < Run AVWAP":
+                    short_entry_proxy = short_run_avwap > 0 and bar.close < short_run_avwap
+                elif cfg.short_trigger == "Any Reversal":
+                    short_entry_proxy = (
+                        (i > 0 and bar.close < bars[i - 1].low) or
+                        (bar.close < bar.open and i > 0 and bar.close < bars[i - 1].close) or
+                        (short_run_avwap > 0 and bar.close < short_run_avwap)
+                    )
+
             # Close strength
             bar_rng = max(bar.high - bar.low, 0.0001)
             short_close_str = (bar.high - bar.close) / bar_rng
             short_close_ok = short_close_str >= cfg.min_close_strength
 
-            # Stop price
-            if cfg.short_stop_mode == "Run Peak":
+            # Stop price — V9 uses tighter ATR-based stop for liquid names
+            if cfg.short_detection_mode == "zscore":
+                short_stop = bar.close + (atr_calc(bars[:i + 1], cfg.atr_len) * cfg.short_v9_stop_atr_mult)
+            elif cfg.short_stop_mode == "Run Peak":
                 short_stop = parabolic_peak * (1 + cfg.stop_buffer / 100)
             elif cfg.short_stop_mode == "Trigger Bar High":
                 short_stop = bar.high * (1 + cfg.stop_buffer / 100)
@@ -806,12 +937,18 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     tf = sma(closes, cfg.target_ma_fast)
                     ts = sma(closes, cfg.target_ma_slow)
 
+                    # Apply slippage to entry price
+                    entry_px = apply_slippage(bar.close, "SHORT", "entry",
+                                              cfg.slippage_pct, cfg.gap_stress_pct)
+                    # Recalculate risk with slipped entry
+                    risk_pct = ((short_stop - entry_px) / entry_px) * 100 if entry_px > 0 else 0.0
+
                     trade = Trade(
                         ticker=ticker,
                         direction="SHORT",
                         entry_bar=i,
                         entry_date=bar.date,
-                        entry_price=bar.close,
+                        entry_price=entry_px,
                         stop_price=short_stop,
                         target_fast=tf,
                         target_slow=ts,
@@ -939,12 +1076,17 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     tf = sma(closes, cfg.target_ma_fast)
                     ts = sma(closes, cfg.target_ma_slow)
 
+                    # Apply slippage to entry price
+                    entry_px = apply_slippage(bar.close, "LONG", "entry",
+                                              cfg.slippage_pct, cfg.gap_stress_pct)
+                    risk_pct = ((entry_px - long_stop) / entry_px) * 100 if entry_px > 0 else 0.0
+
                     trade = Trade(
                         ticker=ticker,
                         direction="LONG",
                         entry_bar=i,
                         entry_date=bar.date,
-                        entry_price=bar.close,
+                        entry_price=entry_px,
                         stop_price=long_stop,
                         target_fast=tf,
                         target_slow=ts,
@@ -984,6 +1126,23 @@ def run_backtest(ticker: str, bars: list, cfg: Config) -> list:
                     t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
                 if t.risk_pct > 0:
                     t.r_multiple = t.pnl_pct / t.risk_pct
+
+    # Apply exit slippage to all closed trades (post-processing)
+    if cfg.slippage_pct > 0 or cfg.gap_stress_pct > 0:
+        for t in trades:
+            if t.exit_reason in ("", "OPEN_AT_END"):
+                continue
+            # Apply slippage to exit price
+            slipped_exit = apply_slippage(t.exit_price, t.direction, "exit",
+                                          cfg.slippage_pct, cfg.gap_stress_pct)
+            t.exit_price = slipped_exit
+            # Recalculate PnL with slipped exit
+            if t.direction == "SHORT":
+                t.pnl_pct = ((t.entry_price - t.exit_price) / t.entry_price) * 100
+            else:
+                t.pnl_pct = ((t.exit_price - t.entry_price) / t.entry_price) * 100
+            if t.risk_pct > 0:
+                t.r_multiple = t.pnl_pct / t.risk_pct
 
     return trades
 
@@ -1779,6 +1938,338 @@ def run_risk_normalized(csv_files: list, cfg: 'Config' = None,
 
 
 # ═══════════════════════════════════════════════════════════════════
+# V9: LIQUID-AWARE SHORT — 3-TIER DEV/VALIDATION/OOS
+# ═══════════════════════════════════════════════════════════════════
+
+def _tier_assign(ticker: str, seed: int = 42) -> int:
+    """Deterministic 3-tier assignment: 0=Tier1(dev), 1=Tier2(val), 2=Tier3(OOS)."""
+    import hashlib
+    h = int(hashlib.md5(f"{seed}_{ticker}".encode()).hexdigest(), 16)
+    bucket = h % 1000
+    if bucket < 70:      # ~7% → Tier 1 fast dev
+        return 0
+    elif bucket < 470:   # ~40% → Tier 2 validation
+        return 1
+    else:                # ~53% → Tier 3 OOS
+        return 2
+
+
+def _calc_combo_stats(ticker_bars, cfg):
+    """Run backtest on a set of (ticker, bars) pairs and return summary stats."""
+    all_trades = []
+    for ticker, bars in ticker_bars:
+        trades = run_backtest(ticker, bars, cfg)
+        all_trades.extend(trades)
+
+    closed = [t for t in all_trades if t.exit_reason not in ("OPEN_AT_END", "")]
+    if not closed:
+        return None
+
+    setups = [t for t in all_trades if not t.is_runner]
+    shorts = [t for t in setups if t.direction == "SHORT"]
+    longs = [t for t in setups if t.direction == "LONG"]
+    wins = [t for t in closed if t.pnl_pct > 0]
+    losses = [t for t in closed if t.pnl_pct <= 0]
+    total_weight = sum(t.weight for t in closed)
+    win_weight = sum(t.weight for t in wins)
+    wr = win_weight / total_weight * 100 if total_weight > 0 else 0
+    total_pnl = sum(t.pnl_pct * t.weight for t in closed)
+    avg_pnl = total_pnl / total_weight if total_weight > 0 else 0
+    gross_profit = sum(t.pnl_pct * t.weight for t in wins)
+    gross_loss = abs(sum(t.pnl_pct * t.weight for t in losses))
+    pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+
+    # SHORT-only
+    s_closed = [t for t in closed if t.direction == "SHORT"]
+    s_wins = [t for t in s_closed if t.pnl_pct > 0]
+    s_losses = [t for t in s_closed if t.pnl_pct <= 0]
+    s_wt = sum(t.weight for t in s_closed)
+    s_win_wt = sum(t.weight for t in s_wins)
+    s_wr = s_win_wt / s_wt * 100 if s_wt > 0 else 0
+    s_gp = sum(t.pnl_pct * t.weight for t in s_wins)
+    s_gl = abs(sum(t.pnl_pct * t.weight for t in s_losses))
+    s_pf = s_gp / s_gl if s_gl > 0 else float('inf')
+
+    cumulative = 0.0
+    peak_cum = 0.0
+    max_dd = 0.0
+    for t in sorted(closed, key=lambda x: (x.exit_bar, -x.is_runner)):
+        cumulative += t.pnl_pct * t.weight
+        if cumulative > peak_cum:
+            peak_cum = cumulative
+        dd = peak_cum - cumulative
+        if dd > max_dd:
+            max_dd = dd
+
+    return {
+        'setups': len(setups), 'shorts': len(shorts), 'longs': len(longs),
+        'legs': len(closed),
+        'wr': wr, 'avg_pnl': avg_pnl, 'pf': pf,
+        'cum_pnl': total_pnl, 'max_dd': max_dd,
+        's_setups': len([t for t in shorts]), 's_wr': s_wr, 's_pf': s_pf,
+        'all_trades': all_trades,
+    }
+
+
+def run_v9_analysis(csv_files: list):
+    """V9 liquid-aware short: 3-tier dev/validation/OOS with parameter sweep.
+
+    Tier 1 (~7%, ~530 tickers): fast sweep to find best params
+    Tier 2 (~40%, ~3000 tickers): validate top configs
+    Tier 3 (~53%, ~4000 tickers): untouched OOS final test
+    """
+    from dataclasses import replace
+    import itertools
+    import time
+
+    base_cfg = Config(
+        short_detection_mode="zscore",
+        short_require_rvol=True,
+        short_require_event=True,
+        short_require_reversal=True,
+        slippage_pct=0.10,
+        gap_stress_pct=0.05,
+        enable_short=True,
+        enable_long=True,
+    )
+
+    # ── Load & split into 3 tiers ──
+    tier1, tier2, tier3 = [], [], []
+    skipped = 0
+    print(f"\n  Loading universe...")
+    t0 = time.time()
+    for csv_file in csv_files:
+        ticker = extract_ticker(csv_file)
+        bars = load_csv(csv_file)
+        if len(bars) < 60:
+            skipped += 1
+            continue
+        tier = _tier_assign(ticker)
+        entry = (ticker, bars)
+        if tier == 0:
+            tier1.append(entry)
+        elif tier == 1:
+            tier2.append(entry)
+        else:
+            tier3.append(entry)
+    load_time = time.time() - t0
+
+    total = len(tier1) + len(tier2) + len(tier3)
+    print(f"\n  ═══ V9 LIQUID-AWARE SHORT — 3-TIER ANALYSIS ═══")
+    print(f"  Universe: {total} tickers (skipped {skipped} < 60 bars)")
+    print(f"  Tier 1 (dev):  {len(tier1):>5} tickers (~7%)")
+    print(f"  Tier 2 (val):  {len(tier2):>5} tickers (~40%)")
+    print(f"  Tier 3 (OOS):  {len(tier3):>5} tickers (~53%)")
+    print(f"  Load time: {load_time:.1f}s")
+    print(f"  Slippage: {base_cfg.slippage_pct}% + {base_cfg.gap_stress_pct}% gap stress")
+    print(f"  Detection: z-score | RVOL spike | event structure | reversal confirm")
+
+    # ═══════════════════════════════════════════════════════════════
+    # TIER 1: Fast sweep on ~530 tickers
+    # ═══════════════════════════════════════════════════════════════
+    z_thresholds = [2.0, 2.5, 3.0, 3.5, 4.0]
+    rvol_mins = [1.5, 2.0, 3.0]
+    stop_atr_mults = [1.5, 2.0, 3.0]
+    reversal_modes = ["bearish_bar", "close_below_vwap", "any"]
+
+    grid_size = len(z_thresholds) * len(rvol_mins) * len(stop_atr_mults) * len(reversal_modes)
+    print(f"\n  ── TIER 1: Sweep on {len(tier1)} dev tickers ({grid_size} combos) ──")
+    print(f"  Z: {z_thresholds} | RVOL: {rvol_mins} | Stop: {stop_atr_mults} | Rev: {reversal_modes}")
+
+    header = (f"  {'#':>4} {'Z':>4} {'RV':>4} {'Stop':>5} {'Rev':<16} "
+              f"{'Set':>5} {'S':>4} {'L':>4} {'WR%':>6} {'PF':>6} "
+              f"{'S_PF':>6} {'CumPnL':>9} {'MaxDD':>7}")
+    print(f"\n{header}")
+    print(f"  {'─' * 92}")
+
+    results = []
+    combo_num = 0
+    t1_start = time.time()
+
+    for z_t, rv_min, stop_m, rev_mode in itertools.product(
+            z_thresholds, rvol_mins, stop_atr_mults, reversal_modes):
+        combo_num += 1
+        cfg = replace(base_cfg,
+                      short_z_threshold=z_t,
+                      short_rvol_min=rv_min,
+                      short_v9_stop_atr_mult=stop_m,
+                      short_reversal_mode=rev_mode,
+                      )
+
+        stats = _calc_combo_stats(tier1, cfg)
+        if stats is None:
+            continue
+
+        print(f"  {combo_num:>4} {z_t:>4.1f} {rv_min:>4.1f} {stop_m:>5.1f} {rev_mode:<16} "
+              f"{stats['setups']:>5} {stats['shorts']:>4} {stats['longs']:>4} "
+              f"{stats['wr']:>5.1f}% {stats['pf']:>5.2f} "
+              f"{stats['s_pf']:>5.2f} {stats['cum_pnl']:>+8.1f}% {stats['max_dd']:>6.1f}%")
+
+        results.append({
+            'z': z_t, 'rvol': rv_min, 'stop_atr': stop_m, 'rev': rev_mode,
+            **{k: v for k, v in stats.items() if k != 'all_trades'},
+        })
+
+    t1_elapsed = time.time() - t1_start
+    print(f"\n  Tier 1 sweep time: {t1_elapsed:.1f}s ({t1_elapsed/max(combo_num,1):.1f}s/combo)")
+
+    # ── Top configs by portfolio PF ──
+    viable = [r for r in results if r['setups'] >= 5]
+    # Rank by combined PF, with SHORT PF as tiebreaker
+    top_dev = sorted(viable, key=lambda r: (r['pf'], r['s_pf']), reverse=True)[:10]
+
+    print(f"\n  ═══ TOP 10 TIER 1 CONFIGS (min 5 setups) ═══")
+    for idx, r in enumerate(top_dev, 1):
+        print(f"  {idx:>3} Z={r['z']:.1f} RV={r['rvol']:.1f} Stop={r['stop_atr']:.1f} Rev={r['rev']:<16} | "
+              f"PF={r['pf']:>5.2f} S_PF={r['s_pf']:>5.2f} WR={r['wr']:>5.1f}% "
+              f"Setups={r['setups']:>4} (S:{r['shorts']} L:{r['longs']}) CumPnL={r['cum_pnl']:>+8.1f}%")
+
+    if not top_dev:
+        print("  No viable Tier 1 configs found.")
+        return results
+
+    # ═══════════════════════════════════════════════════════════════
+    # TIER 2: Validate top 5 on ~3000 tickers
+    # ═══════════════════════════════════════════════════════════════
+    print(f"\n  ═══ TIER 2: VALIDATION on {len(tier2)} tickers ═══")
+    print(f"  Testing top 5 Tier 1 configs")
+
+    t2_header = (f"  {'#':>3} {'Z':>4} {'RV':>4} {'Stop':>5} {'Rev':<16} "
+                 f"{'T1_PF':>6} {'T2_Set':>6} {'T2_S':>5} {'T2_L':>5} "
+                 f"{'T2_WR%':>7} {'T2_PF':>7} {'T2_S_PF':>7} {'T2_Cum':>9} {'T2_DD':>7}")
+    print(t2_header)
+    t2_start = time.time()
+
+    t2_results = []
+    for idx, r in enumerate(top_dev[:5], 1):
+        cfg = replace(base_cfg,
+                      short_z_threshold=r['z'],
+                      short_rvol_min=r['rvol'],
+                      short_v9_stop_atr_mult=r['stop_atr'],
+                      short_reversal_mode=r['rev'],
+                      )
+
+        stats = _calc_combo_stats(tier2, cfg)
+        if stats is None:
+            print(f"  {idx:>3} Z={r['z']:.1f} RV={r['rvol']:.1f} Stop={r['stop_atr']:.1f} Rev={r['rev']:<16} | "
+                  f"T1={r['pf']:>5.2f} | (no Tier 2 trades)")
+            continue
+
+        print(f"  {idx:>3} {r['z']:>4.1f} {r['rvol']:>4.1f} {r['stop_atr']:>5.1f} {r['rev']:<16} "
+              f"{r['pf']:>6.2f} {stats['setups']:>6} {stats['shorts']:>5} {stats['longs']:>5} "
+              f"{stats['wr']:>6.1f}% {stats['pf']:>7.2f} {stats['s_pf']:>7.2f} "
+              f"{stats['cum_pnl']:>+8.1f}% {stats['max_dd']:>6.1f}%")
+
+        t2_results.append({
+            't1_rank': idx, 't1_pf': r['pf'], 't1_s_pf': r['s_pf'],
+            'z': r['z'], 'rvol': r['rvol'], 'stop_atr': r['stop_atr'], 'rev': r['rev'],
+            't2_pf': stats['pf'], 't2_s_pf': stats['s_pf'],
+            't2_wr': stats['wr'], 't2_setups': stats['setups'],
+            't2_shorts': stats['shorts'], 't2_longs': stats['longs'],
+            't2_cum_pnl': stats['cum_pnl'], 't2_max_dd': stats['max_dd'],
+        })
+
+    t2_elapsed = time.time() - t2_start
+    print(f"  Tier 2 time: {t2_elapsed:.1f}s")
+
+    # Best Tier 2 config: highest portfolio PF on validation set
+    if not t2_results:
+        print("  No viable Tier 2 results.")
+        return results
+
+    best_t2 = max(t2_results, key=lambda r: r['t2_pf'])
+
+    # ═══════════════════════════════════════════════════════════════
+    # TIER 3: Final OOS test on ~4000 untouched tickers
+    # ═══════════════════════════════════════════════════════════════
+    print(f"\n  ═══ TIER 3: OOS on {len(tier3)} untouched tickers ═══")
+    print(f"  Config: Z={best_t2['z']:.1f} RV={best_t2['rvol']:.1f} "
+          f"Stop={best_t2['stop_atr']:.1f} Rev={best_t2['rev']}")
+    print(f"  T1 PF={best_t2['t1_pf']:.2f} → T2 PF={best_t2['t2_pf']:.2f}")
+
+    cfg = replace(base_cfg,
+                  short_z_threshold=best_t2['z'],
+                  short_rvol_min=best_t2['rvol'],
+                  short_v9_stop_atr_mult=best_t2['stop_atr'],
+                  short_reversal_mode=best_t2['rev'],
+                  )
+
+    t3_start = time.time()
+    stats = _calc_combo_stats(tier3, cfg)
+    t3_elapsed = time.time() - t3_start
+
+    if stats is None:
+        print("  (no OOS trades)")
+        return results
+
+    oos_pf = stats['pf']
+    verdict = "PASS" if oos_pf >= 1.2 else ("MARGINAL" if oos_pf >= 1.0 else "FAIL")
+
+    print(f"\n  ── OOS Results (after slippage + gap stress) ──")
+    print(f"  Setups: {stats['setups']} (S:{stats['shorts']} L:{stats['longs']}) | Legs: {stats['legs']}")
+    print(f"  Portfolio WR: {stats['wr']:.1f}% | Portfolio PF: {oos_pf:.2f}")
+    print(f"  SHORT WR: {stats['s_wr']:.1f}% | SHORT PF: {stats['s_pf']:.2f}")
+    print(f"  CumPnL: {stats['cum_pnl']:+.1f}% | MaxDD: {stats['max_dd']:.1f}%")
+    print(f"  Tier 3 time: {t3_elapsed:.1f}s")
+
+    print(f"\n  ── Tier Stability ──")
+    print(f"  T1 (dev)  PF: {best_t2['t1_pf']:.2f} | S_PF: {best_t2['t1_s_pf']:.2f}")
+    print(f"  T2 (val)  PF: {best_t2['t2_pf']:.2f} | S_PF: {best_t2['t2_s_pf']:.2f}")
+    print(f"  T3 (OOS)  PF: {oos_pf:.2f} | S_PF: {stats['s_pf']:.2f}")
+    print(f"  VERDICT: {verdict} — OOS portfolio PF {'≥' if oos_pf >= 1.2 else '<'} 1.2 after slippage/gap stress")
+
+    # Walk-forward on Tier 3 OOS
+    all_trades = stats['all_trades']
+    if all_trades:
+        print(f"\n  ── Walk-Forward (4 slices, Tier 3 OOS) ──")
+        # Build timestamp map from tier3
+        ticker_bar_map = {tkr: brs for tkr, brs in tier3}
+        all_timestamps = []
+        for _, brs in tier3:
+            all_timestamps.extend(b.timestamp for b in brs)
+        t_min = min(all_timestamps)
+        t_max = max(all_timestamps)
+        n_slices = 4
+        slice_size = (t_max - t_min) / n_slices
+        slice_bounds = [(t_min + int(j * slice_size), t_min + int((j + 1) * slice_size))
+                        for j in range(n_slices)]
+
+        for t in all_trades:
+            brs = ticker_bar_map.get(t.ticker)
+            if brs:
+                if t.exit_bar >= 0 and t.exit_bar < len(brs):
+                    t._exit_ts = brs[t.exit_bar].timestamp
+                else:
+                    t._exit_ts = brs[-1].timestamp
+            else:
+                t._exit_ts = 0
+
+        from datetime import datetime as dt_cls
+        from datetime import timezone as tz
+        profitable_slices = 0
+        for j, (t_s, t_e) in enumerate(slice_bounds):
+            d_s = dt_cls.fromtimestamp(t_s, tz=tz.utc).strftime('%Y-%m-%d')
+            d_e = dt_cls.fromtimestamp(t_e, tz=tz.utc).strftime('%Y-%m-%d')
+            sl_trades = [t for t in all_trades if hasattr(t, '_exit_ts') and t_s <= t._exit_ts < t_e]
+            sl_stats = _compute_slice_stats(sl_trades)
+            if sl_stats:
+                if sl_stats['pf'] > 1.0:
+                    profitable_slices += 1
+                print(f"  Slice {j+1} ({d_s} → {d_e}): Setups={sl_stats['setups']:>4} "
+                      f"WR={sl_stats['wr']:>5.1f}% PF={sl_stats['pf']:>5.2f} "
+                      f"CumPnL={sl_stats['cum_pnl']:>+8.1f}%")
+            else:
+                print(f"  Slice {j+1} ({d_s} → {d_e}): (no trades)")
+
+        print(f"  Profitable slices: {profitable_slices}/{n_slices}")
+
+    total_time = time.time() - t0
+    print(f"\n  Total V9 analysis time: {total_time:.1f}s")
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1813,6 +2304,11 @@ def main():
         action="store_true",
         help="Run all analyses: short stop sweep, walk-forward, risk sim",
     )
+    parser.add_argument(
+        "--v9",
+        action="store_true",
+        help="V9: Liquid-aware short with z-score detection, RVOL/event gates, reversal confirmation, slippage, dev/OOS split",
+    )
     args = parser.parse_args()
 
     candidates = []
@@ -1839,6 +2335,10 @@ def main():
     if not csv_files:
         print(f"ERROR: No data files (*.csv, *.txt) found in {data_dir} (searched recursively)")
         sys.exit(1)
+
+    if args.v9:
+        run_v9_analysis(csv_files)
+        return
 
     if args.sweep:
         run_sweep(csv_files)
