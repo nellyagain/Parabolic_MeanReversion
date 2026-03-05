@@ -2067,9 +2067,9 @@ def run_v9_analysis(csv_files: list):
     # ═══════════════════════════════════════════════════════════════
     # TIER 1: Fast sweep on ~530 tickers
     # ═══════════════════════════════════════════════════════════════
-    z_thresholds = [2.0, 2.5, 3.0, 3.5, 4.0]
-    rvol_mins = [1.5, 2.0, 3.0]
-    stop_atr_mults = [1.5, 2.0, 3.0]
+    z_thresholds = [2.0, 3.0, 4.0]
+    rvol_mins = [1.5, 2.5]
+    stop_atr_mults = [1.5, 2.5]
     reversal_modes = ["bearish_bar", "close_below_vwap", "any"]
 
     grid_size = len(z_thresholds) * len(rvol_mins) * len(stop_atr_mults) * len(reversal_modes)
